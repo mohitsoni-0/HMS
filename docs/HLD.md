@@ -427,6 +427,11 @@ classDiagram
 | Idempotency | `hb:idem:v1:{scope}:{principal}:{key}` | encrypted record (state, HMAC fingerprint, response); 60 s in progress, 24 h completed |
 | Encrypted-payload replay guard | `hb:enc:v1:{sha256(wrapped key)}` | flag; 5 min |
 
+Redis is never the source of truth:
+- If it is down, rate limiting fails open, except for payments, which fail closed.
+- Idempotency falls back to Postgres: the payment table's unique key plus a durable replay check in the pay flow, so a payment still cannot be charged twice.
+- IDOR ownership is always read from Postgres (no cache), so it can never be stale.
+
 ### 8.6 Scaling the data tier
 
 | Concern | Design |
@@ -436,11 +441,6 @@ classDiagram
 | Reads | `discovery.listing` is a denormalised read model (GIN on amenities, composite city index), so it can be served from a read replica or replaced by a search engine without touching writers |
 | Connections | PgBouncer (transaction pooling) or Django's psycopg pool in production |
 | Invariants in the database | CHECK, UNIQUE and partial-index constraints guard counters, dates, amounts and idempotency keys even if application code is wrong |
-
-Redis is never the source of truth:
-- If it is down, rate limiting fails open, except for payments, which fail closed.
-- Idempotency falls back to Postgres: the payment table's unique key plus a durable replay check in the pay flow, so a payment still cannot be charged twice.
-- IDOR ownership is always read from Postgres (no cache), so it can never be stale.
 
 ## 9. Concurrency and consistency
 
