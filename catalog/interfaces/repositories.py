@@ -22,7 +22,7 @@ class OwnerAccountRepository(ABC):
 class PropertyRepository(ABC):
     @abstractmethod
     def add(self, property_: Property) -> None:
-        """Persist a new property together with its room types."""
+        """Persist a new property with its room types; a name taken in the property -> Conflict(DUPLICATE_ROOM_TYPE_NAME)."""
 
     @abstractmethod
     def add_room_type(self, room_type: RoomType) -> None:

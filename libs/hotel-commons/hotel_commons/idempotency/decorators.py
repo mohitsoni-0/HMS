@@ -2,11 +2,16 @@
 
 A retried request carrying the same ``Idempotency-Key`` gets the first response back instead of running
 the use case again. Keys are scoped per user and endpoint scope; a fingerprint (HMAC of method, path and
-canonical body) catches a key reused for a different request. The Redis layer is an optimisation: when
-Redis is unreachable the view runs anyway, and the database's unique idempotency keys keep writes single.
+canonical body) catches a key reused for a different request.
 
-Responses below 500, returned or raised as ``AppError``, are stored and replayed; a 5xx or an unexpected
-exception releases the key so the client can retry.
+Redis fails open: when it is unreachable, or a result could not be recorded, the view runs again on a retry.
+Only a use case that also stores the key with its write stays single then: payments and refunds (unique
+idempotency key in ``payment``) and booking create (unique ``(guest_id, idempotency_key)`` on
+``booking.booking``). Every other scope, such as cancel or catalog writes, is best-effort idempotent while
+Redis is down.
+
+Responses below 500, returned or raised as ``AppError``, are stored and replayed. A 5xx, a ``RetryLater``
+(lock or statement timeout, rate limit) or an unexpected exception releases the key so the client can retry.
 """
 
 import functools
@@ -28,7 +33,7 @@ from rest_framework.utils.encoders import JSONEncoder
 from hotel_commons.api.exception_handler import envelope_exception_handler
 from hotel_commons.consts import IDEMPOTENCY_KEY_HEADER, IDEMPOTENT_REPLAYED_HEADER
 from hotel_commons.context import RequestContext
-from hotel_commons.exceptions import AppError, BusinessRuleViolation, Conflict, ValidationFailed
+from hotel_commons.exceptions import AppError, BusinessRuleViolation, Conflict, RetryLater, ValidationFailed
 from hotel_commons.idempotency.interfaces import IdempotencyStore, StoredResponse
 from hotel_commons.idempotency.redis_store import get_idempotency_store
 from hotel_commons.redis.client import redis_key
@@ -106,15 +111,17 @@ class _IdempotentCall:
     def _run_and_record(
         self, view_call: Callable[[], Response], view: Any, request: Request, ttl_seconds: int
     ) -> Response:
+        retryable = False
         try:
             response = view_call()
         except AppError as exc:
+            retryable = isinstance(exc, RetryLater)
             response = envelope_exception_handler(exc, {"view": view, "request": request})
         except Exception:
             self._quietly(self._store.release, self._key)
             raise
         body = getattr(response, "data", None)
-        if response.status_code >= SERVER_ERROR_STATUS or not isinstance(body, dict):
+        if retryable or response.status_code >= SERVER_ERROR_STATUS or not isinstance(body, dict):
             self._quietly(self._store.release, self._key)
             return response
         stored = StoredResponse(http_status=response.status_code, body=body)

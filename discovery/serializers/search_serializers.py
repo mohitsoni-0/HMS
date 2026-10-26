@@ -1,7 +1,8 @@
 """Search serializers (LLD §10.3).
 
 ``SearchQuerySerializer`` reads the query string (rupee amounts, comma lists, enum names) into a
-``SearchCriteria``; ``SearchPageSerializer`` renders a ``SearchPage`` with amounts as rupee strings and a
+``SearchCriteria`` and refuses amenity codes the catalog does not know (the stay's booking window is checked
+by ``SearchService``); ``SearchPageSerializer`` renders a ``SearchPage`` with amounts as rupee strings and a
 sibling ``currency``.
 """
 
@@ -13,6 +14,7 @@ from django.conf import settings
 from rest_framework.exceptions import ValidationError
 
 from catalog.public.enums import PricingStrategyCode, PropertyType
+from discovery import container
 from discovery.domain.criteria import MAX_PAGE_SIZE, MAX_STAR_RATING, SearchCriteria, SortOrder
 from discovery.domain.listing import MAX_AMENITY_CODE_LENGTH
 from hotel_commons.domain.date_range import DateRange
@@ -55,6 +57,14 @@ class SearchQuerySerializer(BaseHotelSerializer):
     page = HotelIntegerField(min_value=1, default=1)
     page_size = HotelIntegerField(min_value=1, max_value=MAX_PAGE_SIZE, default=20)
 
+    def validate_amenities(self, codes: list[str]) -> list[str]:
+        """Upper-cased codes, every one known to the catalog: a typo is a 400, not an empty result."""
+        normalized = [code.upper() for code in codes]
+        unknown = sorted(set(normalized) - container.amenity_catalog().known_amenity_codes())
+        if unknown:
+            raise ValidationError(f"Unknown amenity codes: {', '.join(unknown)}.")
+        return normalized
+
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         errors = {**_stay_errors(attrs["check_in"], attrs["check_out"]), **_price_errors(attrs)}
         if errors:
@@ -71,7 +81,7 @@ class SearchQuerySerializer(BaseHotelSerializer):
             locality=data.get("locality") or None,
             min_price=_money(data.get("min_price")),
             max_price=_money(data.get("max_price")),
-            amenities=frozenset(code.upper() for code in data.get("amenities", ())),
+            amenities=frozenset(data.get("amenities", ())),
             min_star_rating=data.get("min_rating"),
             property_types=frozenset(data.get("property_types", ())),
             sort=data["sort"],

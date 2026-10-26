@@ -1,7 +1,8 @@
 """Pricing strategies (LLD §6): how a room type's base price becomes a rate for each night of a stay.
 
 Factors multiply as Decimals and each night is rounded ROUND_HALF_UP to a whole paisa once, after all
-factors, by ``Money.times``. Only ``DynamicPricing`` reads occupancy, with one lookup for the whole stay.
+factors, by ``Money.times``. Only ``DynamicPricing`` reads occupancy (``reads_occupancy``), with one lookup for
+the whole stay; ``PricingService.quote_many`` prefetches that lookup once for all such requests.
 """
 
 from abc import ABC, abstractmethod
@@ -32,6 +33,7 @@ class OccupancyLookup(Protocol):
 
 class PricingStrategy(ABC):
     code: ClassVar[PricingStrategyCode]
+    reads_occupancy: ClassVar[bool] = False  # True when ``nightly_rates`` calls the occupancy lookup
 
     @abstractmethod
     def nightly_rates(self, request: PricingRequest, occupancy: OccupancyLookup) -> tuple[NightlyRate, ...]:
@@ -65,6 +67,7 @@ class DynamicPricing(PricingStrategy):
     """
 
     code = PricingStrategyCode.DYNAMIC
+    reads_occupancy = True
 
     def nightly_rates(self, request: PricingRequest, occupancy: OccupancyLookup) -> tuple[NightlyRate, ...]:
         nights = request.stay.dates()

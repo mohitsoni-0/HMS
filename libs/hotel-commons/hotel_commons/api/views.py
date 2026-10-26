@@ -8,6 +8,10 @@ allowed to use the action ever reaches the ownership lookup.
 Per action, a viewset declares its permissions (``permission_classes_by_action``), its rate-limit scope
 (``throttle_scope_by_action``) and its IDOR rules (``idor_rules``); anything undeclared falls back to the
 class-wide permissions, the ``"default"`` scope and no rule.
+
+OPTIONS answers 405 METHOD_NOT_ALLOWED (after authentication and throttling, like any request): there is no
+metadata class, because DRF's would build every action's serializer outside its action and fail with a 500.
+The API is described by the OpenAPI schema instead.
 """
 
 from collections.abc import Mapping, Sequence
@@ -32,6 +36,7 @@ class BaseViewSet(GenericViewSet):
     permission_classes_by_action: ClassVar[Mapping[str, Sequence[type[BasePermission]]]] = {}
     throttle_scope_by_action: ClassVar[Mapping[str, str]] = {}
     idor_rules: ClassVar[Mapping[str, Sequence[IdorRule]]] = {}
+    metadata_class = None  # OPTIONS -> 405, see the module docstring
 
     def get_permissions(self) -> list[BasePermission]:
         classes = self.permission_classes_by_action.get(self.action, self.permission_classes)

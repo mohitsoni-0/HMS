@@ -202,3 +202,29 @@ def test_list_amenities_is_ordered_by_category_then_code(catalog):
     codes = [amenity.code for amenity in catalog.queries.list_amenities()]
 
     assert codes[0] == "AIRPORT_SHUTTLE" and codes[-1] == "TV"
+
+
+class _CountingAmenities(InMemoryAmenityRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+
+    def known_codes(self) -> frozenset[str]:
+        self.reads += 1
+        return super().known_codes()
+
+
+def test_known_amenity_codes_are_cached_until_they_expire(catalog):
+    amenities, now = _CountingAmenities(), [100.0]
+    queries = CatalogQueryService(
+        catalog.accounts, catalog.properties, amenities, amenity_cache_seconds=60, monotonic=lambda: now[0]
+    )
+
+    first = queries.known_amenity_codes()
+    now[0] += 59
+    second = queries.known_amenity_codes()
+    now[0] += 1
+    third = queries.known_amenity_codes()
+
+    assert "WIFI" in first and first == second == third
+    assert amenities.reads == 2

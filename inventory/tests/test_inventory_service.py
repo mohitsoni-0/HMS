@@ -255,6 +255,30 @@ def test_occupancy_reports_reserved_share_per_night(harness: Harness, room_type_
     assert occupancy == {held_night: Decimal("0.5"), free_night: Decimal(0), unprovisioned_night: Decimal(0)}
 
 
+def test_occupancy_many_reports_every_room_type_and_night(harness: Harness, room_type_id: UUID) -> None:
+    other_room_type_id = uuid4()
+    harness.service.provision(other_room_type_id, 4)
+    unknown_room_type_id = uuid4()
+    nights = harness.stay(1, 2).dates()
+    harness.hold(room_type_id, harness.stay(1, 1))
+    harness.hold(other_room_type_id, harness.stay(2, 1), rooms=3)
+
+    occupancy = harness.service.occupancy_many([room_type_id, other_room_type_id, unknown_room_type_id], nights)
+
+    assert occupancy == {
+        room_type_id: {nights[0]: Decimal("0.5"), nights[1]: Decimal(0)},
+        other_room_type_id: {nights[0]: Decimal(0), nights[1]: Decimal("0.75")},
+        unknown_room_type_id: {nights[0]: Decimal(0), nights[1]: Decimal(0)},
+    }
+    assert harness.service.occupancy_many([], nights) == {}
+
+
+def test_booking_window_runs_from_today_to_the_horizon(harness: Harness) -> None:
+    window = harness.service.booking_window()
+
+    assert window == DateRange(harness.today, harness.today + timedelta(days=HORIZON_DAYS))
+
+
 def test_hold_locks_the_nights_of_its_stay(harness: Harness, room_type_id: UUID) -> None:
     stay = harness.stay(1, 2)
 

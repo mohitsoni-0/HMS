@@ -35,6 +35,8 @@ POSTAL_CODE_PATTERN: Final = r"[0-9]{6}"
 
 AMENITY_CODE_MAX_LENGTH: Final = 40
 AMENITY_NAME_MAX_LENGTH: Final = 100
+# How long ``CatalogQueryService.known_amenity_codes`` reuses the codes it read (they are seed data).
+AMENITY_CODES_CACHE_SECONDS: Final = 300.0
 
 # (code, name, category) of the amenities seeded by migration 0002_seed_amenities (LLD §4.6).
 AMENITY_SEED: Final[tuple[tuple[str, str, AmenityCategory], ...]] = (

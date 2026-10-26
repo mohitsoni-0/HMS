@@ -5,6 +5,7 @@ Each racing thread runs ``InventoryAPI.hold`` on its own database connection, so
 tables on the search path, and the context tables live in their own schemas (LLD §3.15).
 """
 
+import re
 import threading
 from collections.abc import Callable, Iterator
 from datetime import timedelta
@@ -12,7 +13,8 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from django.db import connection
+from django.db import connection, transaction
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from hotel_commons.domain.clock import SystemClock
 from hotel_commons.domain.date_range import DateRange
@@ -21,6 +23,8 @@ from uuid6 import uuid7
 
 from inventory.models.inventory_models import Allotment, InventoryHold, InventoryHoldLog, RoomNight
 from inventory.public.api import get_inventory_api
+from inventory.repositories.mappers import room_night_to_domain
+from inventory.repositories.room_night_repository import DjangoRoomNightRepository
 from inventory.status_code import INVENTORY_UNAVAILABLE
 
 pytestmark = [pytest.mark.integration, pytest.mark.django_db(transaction=True)]
@@ -98,13 +102,33 @@ def test_last_room_race_single_winner(last_room: UUID) -> None:
     assert InventoryHold.objects.filter(room_type_id=last_room).count() == 1
 
 
-def test_overlapping_stays_no_deadlock(last_room: UUID) -> None:
-    # Nights 1-3 and 2-4 share night 2, so with one room exactly one of each pair can win.
-    first = DateRange(_days_ahead(11), _days_ahead(13))
-    second = DateRange(_days_ahead(12), _days_ahead(14))
-    nights = DateRange(first.start, second.end)
+# Overlapping stays race on the nights they share. A lock-order deadlock needs at least two shared nights
+# locked in opposite directions, so these stays share three (nights 12-14 of 11-14 and 12-15).
+FIRST_STAY = (11, 15)
+SECOND_STAY = (12, 16)
+OVERLAP_ROUNDS = 20
 
-    for round_ in range(ROUNDS):
+
+def _overlapping_stays() -> tuple[DateRange, DateRange]:
+    return DateRange(_days_ahead(FIRST_STAY[0]), _days_ahead(FIRST_STAY[1])), DateRange(
+        _days_ahead(SECOND_STAY[0]), _days_ahead(SECOND_STAY[1])
+    )
+
+
+def test_overlapping_stays_no_deadlock(last_room: UUID) -> None:
+    """Holds on stays sharing three nights, in both assignments, over many rounds: one wins, never an error.
+
+    Regression caught: a deadlock or lock timeout between overlapping multi-night holds (an "error" outcome
+    instead of ok + conflict), or an oversold or leaked night counter. The nights are locked by one
+    ``SELECT ... ORDER BY stay_date FOR UPDATE``, so a real deadlock needs a lock-order regression *and*
+    unlucky timing; ``test_lock_for_stay_locks_nights_in_date_order`` pins the order deterministically and
+    ``test_opposite_lock_order_is_reported_as_an_error`` proves this harness turns a deadlock into a failure.
+    """
+    first, second = _overlapping_stays()
+    nights = DateRange(first.start, second.end)
+    assert len(set(first.dates()) & set(second.dates())) >= 2
+
+    for round_ in range(OVERLAP_ROUNDS):
         stays = (first, second) if round_ % 2 == 0 else (second, first)
 
         results = _race([_hold_attempt(last_room, stay, f"overlap-{round_}-{n}") for n, stay in enumerate(stays)])
@@ -117,3 +141,65 @@ def test_overlapping_stays_no_deadlock(last_room: UUID) -> None:
         }, f"round {round_}"
         get_inventory_api().release_hold(hold_id, "CANCELLED")
         assert set(_reserved(last_room, nights).values()) == {0}
+
+
+def test_hold_racing_a_release_of_an_overlapping_stay(last_room: UUID) -> None:
+    """A release (which locks its nights too) racing a hold of an overlapping stay: no deadlock, no lost update."""
+    first, second = _overlapping_stays()
+    nights = DateRange(first.start, second.end)
+
+    for round_ in range(OVERLAP_ROUNDS):
+        held, wanted = (first, second) if round_ % 2 == 0 else (second, first)
+        hold_id = _hold_attempt(last_room, held, f"release-{round_}-held")()
+
+        release = lambda hold_id=hold_id: get_inventory_api().release_hold(hold_id, "CANCELLED")  # noqa: E731
+        results = _race([release, _hold_attempt(last_room, wanted, f"release-{round_}-wanted")])
+
+        assert results[0] == ("ok", None), results
+        assert results[1][0] in {"ok", "conflict"}, results  # the hold may run before or after the release
+        expected = {night: int(results[1][0] == "ok" and night in wanted.dates()) for night in nights.dates()}
+        assert _reserved(last_room, nights) == expected, f"round {round_}: {results}"
+        if results[1][0] == "ok":
+            get_inventory_api().release_hold(results[1][1], "CANCELLED")
+
+
+def test_lock_for_stay_locks_nights_in_date_order(last_room: UUID) -> None:
+    """The deterministic half of the guarantee: one FOR UPDATE statement, ordered by stay_date ascending."""
+    first, _ = _overlapping_stays()
+
+    with transaction.atomic(), CaptureQueriesContext(connection) as queries:
+        locked = DjangoRoomNightRepository().lock_for_stay(last_room, first)
+
+    assert [night.stay_date for night in locked] == list(first.dates())
+    [sql] = [query["sql"] for query in queries.captured_queries if "FOR UPDATE" in query["sql"]]
+    assert re.search(r'ORDER BY "?[\w"\.]*"?stay_date"? ASC FOR UPDATE$', sql), sql
+
+
+def test_opposite_lock_order_is_reported_as_an_error(last_room: UUID, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: lock the shared nights in opposite directions and the race reports a deadlock.
+
+    The patched repository locks night by night and waits on a barrier once each side holds one shared night,
+    which makes the lock cycle certain. PostgreSQL then aborts one side with "deadlock detected", and the
+    harness reports it as an "error" outcome: exactly what ``test_overlapping_stays_no_deadlock`` rejects.
+    """
+    first, second = _overlapping_stays()
+    both_hold_a_shared_night = threading.Barrier(2)
+
+    def lock_night_by_night(self: DjangoRoomNightRepository, room_type_id: UUID, stay: DateRange) -> list[Any]:
+        ascending = stay == first
+        dates = list(stay.dates()) if ascending else list(reversed(stay.dates()))
+        shared = set(first.dates()) & set(second.dates())
+        rows = []
+        for night in dates:
+            rows.append(RoomNight.objects.select_for_update().get(room_type_id=room_type_id, stay_date=night))
+            if night in shared and len([row for row in rows if row.stay_date in shared]) == 1:
+                both_hold_a_shared_night.wait(timeout=JOIN_TIMEOUT_SECONDS)
+        return [room_night_to_domain(row) for row in sorted(rows, key=lambda row: row.stay_date)]
+
+    monkeypatch.setattr(DjangoRoomNightRepository, "lock_for_stay", lock_night_by_night)
+
+    results = _race([_hold_attempt(last_room, first, "cycle-0"), _hold_attempt(last_room, second, "cycle-1")])
+
+    errors = [value for kind, value in results if kind == "error"]
+    assert len(errors) == 1 and "deadlock detected" in errors[0], results
+    assert [kind for kind, _ in results].count("ok") == 1, results

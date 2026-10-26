@@ -4,12 +4,12 @@ A standalone hotelier is an account with one property and a chain an account wit
 Contact details are PII. They never appear in ``repr`` or in error messages.
 """
 
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Final, Self
+from typing import Self
 from uuid import UUID
 
+from hotel_commons.domain.validation import is_indian_mobile, is_valid_email, normalize_email
 from hotel_commons.exceptions import ValidationFailed
 from hotel_commons.status_code import VALIDATION_FAILED
 from uuid6 import uuid7
@@ -17,23 +17,22 @@ from uuid6 import uuid7
 from catalog.constants import OWNER_DISPLAY_NAME_MAX_LENGTH, OWNER_DISPLAY_NAME_MIN_LENGTH, OWNER_USER_ID_MAX_LENGTH
 from catalog.status_code import INVALID_CONTACT
 
-_EMAIL: Final = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s.]+")
-_INDIAN_MOBILE: Final = re.compile(r"[6-9][0-9]{9}")
-_MAX_EMAIL_LENGTH: Final = 254
-
 
 @dataclass(frozen=True, slots=True)
 class ContactDetails:
-    """Owner contact: an e-mail address (stored lower-cased) and an Indian mobile number."""
+    """Owner contact: an e-mail address (stored lower-cased) and an Indian mobile number.
+
+    Validated with the shared ``hotel_commons.domain.validation`` rules, like a guest's contact in booking.
+    """
 
     email: str = field(repr=False)
     phone: str = field(repr=False)
 
     def __post_init__(self) -> None:
-        email, phone = self.email.strip().lower(), self.phone.strip()
-        if len(email) > _MAX_EMAIL_LENGTH or not _EMAIL.fullmatch(email):
+        email, phone = normalize_email(self.email), self.phone.strip()
+        if not is_valid_email(email):
             raise ValidationFailed(INVALID_CONTACT, reason="contact_email is not a valid e-mail address")
-        if not _INDIAN_MOBILE.fullmatch(phone):
+        if not is_indian_mobile(phone):
             raise ValidationFailed(INVALID_CONTACT, reason="contact_phone must be a 10-digit mobile number")
         object.__setattr__(self, "email", email)
         object.__setattr__(self, "phone", phone)

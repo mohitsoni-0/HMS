@@ -51,10 +51,16 @@ Compose starts four services:
 
 | Service | What it runs |
 |---|---|
-| `postgres` | `postgres:18`, on port 5432, with database, user and password all `hotel` |
-| `redis` | `redis:7-alpine`, on port 6379 |
-| `app` | `docker/entrypoint.sh`: `migrate`, then `seed_demo`, then gunicorn on port 8000 |
+| `postgres` | `postgres:18`, on `127.0.0.1:5432`, with database, user and password all `hotel` |
+| `redis` | `redis:7-alpine`, on `127.0.0.1:6379` |
+| `app` | `docker/entrypoint.sh`: `migrate` (with the request DB timeouts off), then `seed_demo`, then gunicorn, on `127.0.0.1:${APP_PORT:-8000}` |
 | `scheduler` | `docker/scheduler.sh`: `expire_pending_bookings` and `extend_inventory_horizon` every 60 s |
+
+Every published port is bound to the loopback interface only. The local stack runs with public dev keys and lets anyone mint an ADMIN token through `/dev/tokens`, so it must not be reachable from the rest of the network.
+
+**Port.** The API listens on host port **8000** by default. If that port is taken, set `APP_PORT` in an untracked `.env` in the repository root (for example `APP_PORT=8001`): compose publishes `127.0.0.1:${APP_PORT:-8000}`, and every URL and curl command below uses the same variable, so `export APP_PORT=8001` in your shell as well. Inside the container the app always listens on 8000.
+
+gunicorn's access log goes to the container's stdout (`docker compose logs app`). It records the method, the path without its query string, the status, the size, the duration and the request id: query parameters such as `guest_id` can carry an email address, and the access log does not pass through the PII redaction filter that the application logs use.
 
 Migrations and the demo data load automatically, so search works as soon as the app reports healthy. `seed_demo` is idempotent. It creates:
 
@@ -65,7 +71,7 @@ Migrations and the demo data load automatically, so search works as soon as the 
 
 Useful URLs:
 
-| URL | |
+| URL (port 8000 unless `APP_PORT` says otherwise) | |
 |---|---|
 | http://localhost:8000/hotel/v1/docs | Swagger UI |
 | http://localhost:8000/hotel/v1/schema | OpenAPI 3 schema |
@@ -79,7 +85,7 @@ Every endpoint except health, docs, schema, the public key, search, property det
 
 ```sh
 # HTTP: this route exists only when ENVIRONMENT=local
-curl -s -X POST http://localhost:8000/hotel/v1/dev/tokens \
+curl -s -X POST http://localhost:${APP_PORT:-8000}/hotel/v1/dev/tokens \
   -H 'Content-Type: application/json' \
   -d '{"user_id": "guest-1", "roles": ["GUEST"]}'
 # -> {"status": 2100000, "message": "Success", "data": {"token": "eyJ...", "expires_in": 3600}, "request_id": "..."}
@@ -106,15 +112,17 @@ On the wire, amounts are rupee strings with two decimals (`"7000.00"`) and a sib
 
 ## API walkthrough with curl
 
-These steps run the whole lifecycle on a fresh property: owner account, then onboard, search, book, pay, a declined payment, cancel, and search again. Paste them into one shell session, since later steps reuse the variables.
+These steps run the whole lifecycle on a fresh property: owner account, then onboard, search, book, pay, a declined payment, cancel, and search again. Paste them into one shell session (bash or zsh), since later steps reuse the variables. The outputs below are from a real run, with the ids shortened; yours carry your own ids, dates and timestamps.
 
-The stay dates are fixed at 2026-12-15 to 2026-12-17 (Tuesday and Wednesday nights). A stay must start between today and 365 days ahead, so move the dates if that window has passed. Owner contact emails are unique, so a second run against the same database needs a different `contact_email` (or run `docker compose down -v` first).
-
-**0. Setup and tokens.**
+**0. Setup and tokens.** `API` follows `APP_PORT`, the host port the stack publishes (8000 unless your `.env` sets it). The stay is computed as two nights starting 30 days from today, so it always falls inside the booking window, and `RUN` makes the contact email and the Idempotency-Keys unique, so you can run the walkthrough again against the same database.
 
 ```sh
-API=http://localhost:8000/hotel/v1
+API=http://localhost:${APP_PORT:-8000}/hotel/v1
 JSON='Content-Type: application/json'
+RUN=$(date +%s)
+CHECK_IN=$(date -v+30d +%F 2>/dev/null || date -d '+30 days' +%F)    # macOS || GNU date
+CHECK_OUT=$(date -v+32d +%F 2>/dev/null || date -d '+32 days' +%F)
+EXPIRY_YEAR=$(( $(date +%Y) + 2 ))                                     # cards are checked against today
 token() {
   curl -s -X POST "$API/dev/tokens" -H "$JSON" \
     -d "{\"user_id\": \"$1\", \"roles\": [\"$2\"]}" | jq -r .data.token
@@ -127,23 +135,22 @@ GUEST2=$(token guest-2 GUEST)
 **1. Open an owner account** (OWNER or ADMIN). The caller becomes the account's owner.
 
 ```sh
-R=$(curl -s -X POST "$API/catalog/owner-accounts" -H "Authorization: Bearer $OWNER" -H "$JSON" -d '{
-  "display_name": "Pink City Stays",
-  "contact_email": "owner.demo@example.com",
-  "contact_phone": "9876500010"
-}')
+R=$(curl -s -X POST "$API/catalog/owner-accounts" -H "Authorization: Bearer $OWNER" -H "$JSON" -d @- <<EOF
+{"display_name": "Pink City Stays", "contact_email": "owner.$RUN@example.com", "contact_phone": "9876500010"}
+EOF
+)
 echo "$R" | jq .data
 ACCOUNT_ID=$(echo "$R" | jq -r .data.account_id)
 ```
 
 ```json
-{"account_id": "019a...", "display_name": "Pink City Stays", "owner_user_id": "owner-demo",
- "contact_email": "owner.demo@example.com", "contact_phone": "9876500010", "created_at": "2026-10-26T..."}
+{"account_id": "01a1793b-...", "display_name": "Pink City Stays", "owner_user_id": "owner-demo",
+ "contact_email": "owner.1793035311@example.com", "contact_phone": "9876500010", "created_at": "2026-10-26T17:21:51.872015Z"}
 ```
 
-The owner and ADMIN see the contact details in full. Anyone else sees them masked.
+The owner and ADMIN see the contact details in full. Anyone else sees them masked. A contact email already used by another account gets 409 `2101010` ("Owner account could not be created with these contact details"), which does not say whose it is.
 
-**2. Onboard a property** with its room types (HTTP 201). The response includes inventory for the next 365 nights, and a search listing is created in the same transaction.
+**2. Onboard a property** with its room types (HTTP 201). Inventory for the next 365 nights and the search listing are created in the same transaction.
 
 ```sh
 R=$(curl -s -X POST "$API/catalog/owner-accounts/$ACCOUNT_ID/properties" \
@@ -169,68 +176,103 @@ PROPERTY_ID=$(echo "$R" | jq -r .data.property_id)
 ROOM_TYPE_ID=$(echo "$R" | jq -r '.data.room_types[0].room_type_id')
 ```
 
-`country` defaults to `"IN"`. `pricing_strategy`, `cancellation_policy` and the check-in and check-out times are optional (defaults `STANDARD`, `MODERATE`, `14:00` and `11:00`). `GET $API/catalog/amenities` lists the valid amenity codes. A HOTEL or RESORT must have a `star_rating`, and a VILLA must be one room type with `total_rooms: 1` (422 otherwise).
+```json
+{"property_id": "01a1793b-...", "owner_account_id": "01a1793b-...", "name": "Amber Courtyard Hotel",
+ "description": "Heritage hotel near the old city.", "property_type": "HOTEL", "star_rating": 4,
+ "address": {"line1": "12 MI Road", "locality": "C-Scheme", "city": "Jaipur", "state": "Rajasthan",
+             "postal_code": "302001", "country": "IN"},
+ "amenities": ["BREAKFAST", "POOL", "WIFI"], "pricing_strategy": "STANDARD", "cancellation_policy": "MODERATE",
+ "check_in_time": "14:00", "check_out_time": "11:00", "is_active": true,
+ "room_types": [{"room_type_id": "01a1793b-...", "name": "Deluxe Double", "description": "", "max_occupancy": 2,
+                 "total_rooms": 5, "base_price": "3500.00", "currency": "INR",
+                 "amenities": ["AIR_CONDITIONING", "TV"], "is_active": true}]}
+```
+
+`country` defaults to `"IN"`. `pricing_strategy`, `cancellation_policy` and the check-in and check-out times are optional (defaults `STANDARD`, `MODERATE`, `14:00` and `11:00`). `GET $API/catalog/amenities` lists the valid amenity codes. A HOTEL or RESORT must have a `star_rating`, and a VILLA must be one room type with `total_rooms: 1` (422 otherwise). The property keeps its own amenities and each room type its own, as `GET $API/catalog/properties/$PROPERTY_ID` shows.
 
 **3. Search** (public).
 
 ```sh
-curl -s "$API/discovery/search?city=Jaipur&check_in=2026-12-15&check_out=2026-12-17&guests=2" | jq .data
+curl -s "$API/discovery/search?city=Jaipur&check_in=$CHECK_IN&check_out=$CHECK_OUT&guests=2" | jq .data
 ```
 
 ```json
-{"items": [{"property_id": "019a...", "name": "Amber Courtyard Hotel", "property_type": "HOTEL", "star_rating": 4,
-            "city": "Jaipur", "locality": "C-Scheme", "amenities": ["BREAKFAST", "POOL", "WIFI"],
+{"items": [{"property_id": "01a1793b-...", "name": "Amber Courtyard Hotel", "property_type": "HOTEL", "star_rating": 4,
+            "city": "Jaipur", "locality": "C-Scheme",
+            "amenities": ["AIR_CONDITIONING", "BREAKFAST", "POOL", "TV", "WIFI"],
             "lowest_nightly_price": "3500.00", "currency": "INR",
-            "offers": [{"room_type_id": "019a...", "room_type": "Deluxe Double", "max_occupancy": 2,
+            "offers": [{"room_type_id": "01a1793b-...", "room_type": "Deluxe Double", "max_occupancy": 2,
                         "available_rooms": 5, "pricing_strategy": "STANDARD",
-                        "nightly_rates": [{"date": "2026-12-15", "price": "3500.00"},
-                                          {"date": "2026-12-16", "price": "3500.00"}],
+                        "nightly_rates": [{"date": "2026-11-25", "price": "3500.00"},
+                                          {"date": "2026-11-26", "price": "3500.00"}],
                         "total": "7000.00", "average_nightly": "3500.00", "currency": "INR"}]}],
  "page": 1, "page_size": 20, "total": 1}
 ```
 
-`city`, `check_in`, `check_out` and `guests` are required. The optional filters are `rooms`, `locality`, `min_price` and `max_price` (average nightly price, in rupees), `amenities=WIFI,POOL` (all must match), `min_rating`, `property_types=HOTEL,RESORT`, `sort=price_asc|price_desc|rating_desc`, `page` and `page_size` (at most 50). Try the seeded data with `city=Goa` (WEEKEND pricing shows on Friday and Saturday nights) or `city=Bengaluru` (DYNAMIC).
+A second run of the walkthrough also lists the properties of earlier runs. A search result's `amenities` is what a guest can get at the property: the property's own amenities **plus those of its room types** (here `AIR_CONDITIONING` and `TV` come from Deluxe Double), and the `amenities` filter matches against that union.
 
-**4. Book** (GUEST or ADMIN). A `PREPAID` booking holds the rooms for 15 minutes as `PENDING_PAYMENT` (HTTP 201). `Idempotency-Key` is optional here, and a retry with the same key returns the first response.
+`city`, `check_in`, `check_out` and `guests` are required. The optional filters are `rooms`, `locality`, `min_price` and `max_price` (average nightly price, in rupees), `amenities=WIFI,POOL` (all must match), `min_rating`, `property_types=HOTEL,RESORT`, `sort=price_asc|price_desc|rating_desc`, `page` and `page_size` (at most 50). Search applies the booking rules to the dates, so it never lists a stay that cannot be booked: a `check_in` before today, a `check_out` more than 365 days ahead (`INVENTORY_HORIZON_DAYS`), `check_out` not after `check_in`, or a stay longer than 30 nights answers 400 `2100001` with the offending field in `errors`. So does an amenity code the catalogue does not know:
 
 ```sh
-R=$(curl -s -X POST "$API/bookings" -H "Authorization: Bearer $GUEST" -H "$JSON" \
-  -H 'Idempotency-Key: book-demo-0001' -d @- <<EOF
-{"room_type_id": "$ROOM_TYPE_ID", "check_in": "2026-12-15", "check_out": "2026-12-17",
+curl -s "$API/discovery/search?city=Jaipur&check_in=2020-01-01&check_out=2020-01-03&guests=2"
+# {"status": 2100001, "message": "Invalid request details",
+#  "errors": {"check_in": ["check_in cannot be in the past."]}, "data": null, "request_id": "..."}   HTTP 400
+```
+
+Try the seeded data with `city=Goa` (WEEKEND pricing shows on Friday and Saturday nights) or `city=Bengaluru` (DYNAMIC).
+
+**4. Book** (GUEST or ADMIN). A `PREPAID` booking holds the rooms for 15 minutes as `PENDING_PAYMENT` (HTTP 201). `Idempotency-Key` is optional here. When it is sent, it is stored on the booking itself, unique per guest, so a retry with the same key returns the first booking even after Redis has forgotten the key or was down.
+
+```sh
+BOOK=$(cat <<EOF
+{"room_type_id": "$ROOM_TYPE_ID", "check_in": "$CHECK_IN", "check_out": "$CHECK_OUT",
  "rooms": 1, "guests": 2, "booking_type": "PREPAID",
  "guest_name": "Rahul Sharma", "guest_email": "rahul@example.com", "guest_phone": "9876543210"}
 EOF
 )
+R=$(curl -s -X POST "$API/bookings" -H "Authorization: Bearer $GUEST" -H "$JSON" \
+  -H "Idempotency-Key: book-$RUN-1" -d "$BOOK")
 echo "$R" | jq .data
 BOOKING_ID=$(echo "$R" | jq -r .data.booking_id)
 ```
 
 ```json
-{"booking_id": "019a...", "status": "PENDING_PAYMENT", "booking_type": "PREPAID",
- "property_id": "019a...", "room_type_id": "019a...", "check_in": "2026-12-15", "check_out": "2026-12-17",
+{"booking_id": "01a1793b-...", "status": "PENDING_PAYMENT", "booking_type": "PREPAID",
+ "property_id": "01a1793b-...", "room_type_id": "01a1793b-...", "check_in": "2026-11-25", "check_out": "2026-11-27",
  "nights": 2, "rooms": 1, "guests": 2, "total": "7000.00", "currency": "INR",
- "nightly_rates": [{"date": "2026-12-15", "price": "3500.00"}, {"date": "2026-12-16", "price": "3500.00"}],
+ "nightly_rates": [{"date": "2026-11-25", "price": "3500.00"}, {"date": "2026-11-26", "price": "3500.00"}],
  "pricing_strategy": "STANDARD", "cancellation_policy": "MODERATE",
- "hold_expires_at": "2026-10-26T...Z", "payment_id": null,
+ "hold_expires_at": "2026-10-26T17:36:51.965682Z", "payment_id": null,
  "refund": {"amount": null, "percent": null, "status": "NONE"},
  "guest_name": "Rahul Sharma", "guest_email": "rahul@example.com", "guest_phone": "9876543210",
- "last_payment_failure": null, "created_at": "...", "confirmed_at": null, "cancelled_at": null, "expired_at": null}
+ "last_payment_failure": null, "created_at": "2026-10-26T17:21:51.972245Z",
+ "confirmed_at": null, "cancelled_at": null, "expired_at": null}
 ```
 
-The price and the cancellation policy are fixed at booking time. With `"booking_type": "PAY_AT_PROPERTY"`, the booking is `CONFIRMED` at once and has no hold expiry.
+Sending the same request again with the same key books nothing new:
+
+```sh
+curl -s -X POST "$API/bookings" -H "Authorization: Bearer $GUEST" -H "$JSON" \
+  -H "Idempotency-Key: book-$RUN-1" -d "$BOOK" | jq -r .data.booking_id    # the same id as $BOOKING_ID
+```
+
+The price and the cancellation policy are fixed at booking time. With `"booking_type": "PAY_AT_PROPERTY"`, the booking is `CONFIRMED` at once and has no hold expiry. A stay must start between today and 365 days ahead and last 1 to 30 nights, and `guests` may not exceed `rooms × max_occupancy` (422 `2105008`). The last free room going to someone else answers 409 `2102001`.
 
 **5. Pay** (GUEST or ADMIN; the booking must be the caller's own). `Idempotency-Key` is **required**.
 
 ```sh
-PAY_CARD='{"method": "CARD", "card": {"card_number": "4242424242424242", "expiry_month": 12,
-           "expiry_year": 2030, "cvv": "123", "holder_name": "Rahul Sharma"}}'
+PAY_CARD=$(cat <<EOF
+{"method": "CARD", "card": {"card_number": "4242424242424242", "expiry_month": 12,
+ "expiry_year": $EXPIRY_YEAR, "cvv": "123", "holder_name": "Rahul Sharma"}}
+EOF
+)
 curl -s -X POST "$API/bookings/$BOOKING_ID/payments" -H "Authorization: Bearer $GUEST" -H "$JSON" \
-  -H 'Idempotency-Key: pay-demo-0001' -d "$PAY_CARD" | jq '{status, message, booking: .data.booking.status, payment: .data.payment}'
+  -H "Idempotency-Key: pay-$RUN-1" -d "$PAY_CARD" | jq '{status, message, booking: .data.booking.status, payment: .data.payment}'
 ```
 
 ```json
 {"status": 2100000, "message": "Success", "booking": "CONFIRMED",
- "payment": {"payment_id": "019a...", "status": "SUCCEEDED", "instrument": "VISA •••• 4242",
+ "payment": {"payment_id": "01a1793b-...", "status": "SUCCEEDED", "instrument": "VISA •••• 4242",
              "failure_code": null, "failure_message": null}}
 ```
 
@@ -238,47 +280,51 @@ If you send the same request with the same key again, nothing is charged. You ge
 
 ```sh
 curl -s -D - -o /dev/null -X POST "$API/bookings/$BOOKING_ID/payments" -H "Authorization: Bearer $GUEST" \
-  -H "$JSON" -H 'Idempotency-Key: pay-demo-0001' -d "$PAY_CARD" | grep -i idempotent-replayed
+  -H "$JSON" -H "Idempotency-Key: pay-$RUN-1" -d "$PAY_CARD" | grep -i idempotent-replayed
+# Idempotent-Replayed: true
 ```
 
-Reusing the key with a different body gets 422. A request that arrives while the first one with that key is still running gets 409. UPI and wallet payments look like `{"method": "UPI", "upi": {"vpa": "rahul@okaxis"}}` and `{"method": "WALLET", "wallet": {"provider": "PAYTM", "phone": "9876543210"}}`.
+Reusing the key with a different body gets 422 `2100011`, and so does a retry after Redis has forgotten the key: the payment row keeps an HMAC fingerprint of the method and its details (never the card data itself), so the durable replay checks the body too. A request that arrives while the first one with that key is still running gets 409 `2100010`.
+
+```sh
+curl -s -X POST "$API/bookings/$BOOKING_ID/payments" -H "Authorization: Bearer $GUEST" -H "$JSON" \
+  -H "Idempotency-Key: pay-$RUN-1" -d '{"method": "UPI", "upi": {"vpa": "rahul@okaxis"}}' | jq '{status, message}'
+# {"status": 2100011, "message": "Idempotency-Key was already used with a different request"}   HTTP 422
+```
+
+UPI and wallet payments look like `{"method": "UPI", "upi": {"vpa": "rahul@okaxis"}}` and `{"method": "WALLET", "wallet": {"provider": "PAYTM", "phone": "9876543210"}}`. Paying a booking that is already `CONFIRMED` or `CANCELLED` gets 409 `2105002`, and paying a `PAY_AT_PROPERTY` booking gets 422 `2105009`.
 
 **6. A declined card.** Make a second booking and pay with `4000000000000002`. The gateway declines it, and the API answers **HTTP 402** with the booking still `PENDING_PAYMENT`, so the guest can retry with another method and a new key until the hold expires.
 
 ```sh
 R=$(curl -s -X POST "$API/bookings" -H "Authorization: Bearer $GUEST" -H "$JSON" \
-  -H 'Idempotency-Key: book-demo-0002' -d @- <<EOF
-{"room_type_id": "$ROOM_TYPE_ID", "check_in": "2026-12-15", "check_out": "2026-12-17",
- "guests": 2, "guest_name": "Rahul Sharma", "guest_email": "rahul@example.com", "guest_phone": "9876543210"}
-EOF
-)
+  -H "Idempotency-Key: book-$RUN-2" -d "$BOOK")
 BOOKING2_ID=$(echo "$R" | jq -r .data.booking_id)
 
 curl -s -w '\nHTTP %{http_code}\n' -X POST "$API/bookings/$BOOKING2_ID/payments" \
-  -H "Authorization: Bearer $GUEST" -H "$JSON" -H 'Idempotency-Key: pay-demo-0002' -d '{
-  "method": "CARD", "card": {"card_number": "4000000000000002", "expiry_month": 12,
-  "expiry_year": 2030, "cvv": "123", "holder_name": "Rahul Sharma"}}'
+  -H "Authorization: Bearer $GUEST" -H "$JSON" -H "Idempotency-Key: pay-$RUN-2" \
+  -d "${PAY_CARD/4242424242424242/4000000000000002}"
 ```
 
 ```json
 {"status": 2105004, "message": "Payment declined: The card was declined by the issuer",
- "data": {"booking": {"booking_id": "019a...", "status": "PENDING_PAYMENT", "last_payment_failure": "card_declined", "...": "..."},
-          "payment": {"payment_id": "019a...", "status": "FAILED", "instrument": "VISA •••• 0002",
+ "data": {"booking": {"booking_id": "01a1793b-...", "status": "PENDING_PAYMENT", "last_payment_failure": "card_declined", "...": "..."},
+          "payment": {"payment_id": "01a1793b-...", "status": "FAILED", "instrument": "VISA •••• 0002",
                       "failure_code": "card_declined", "failure_message": "The card was declined by the issuer"}},
  "request_id": "..."}
 HTTP 402
 ```
 
-**7. Access rules.** The owner can list the bookings at their property, with the guest's details masked. Another guest gets 404 for a booking that is not theirs, so the API does not even confirm that the booking exists.
+**7. Access rules.** The owner can list the bookings at their property, newest first, with the guest's details masked. Another guest gets 404 for a booking that is not theirs, so the API does not even confirm that the booking exists.
 
 ```sh
 curl -s "$API/bookings?property_id=$PROPERTY_ID" -H "Authorization: Bearer $OWNER" \
-  | jq '.data.items[] | {status, guest_name, guest_email, guest_phone}'
-# one line per booking, e.g.
-# {"status": "CONFIRMED", "guest_name": "R**** S*****", "guest_email": "r****@example.com", "guest_phone": "******3210"}
-# {"status": "PENDING_PAYMENT", "guest_name": "R**** S*****", ...}
+  | jq -c '.data.items[] | {status, guest_name, guest_email, guest_phone}'
+# {"status":"PENDING_PAYMENT","guest_name":"R**** S*****","guest_email":"r****@example.com","guest_phone":"******3210"}
+# {"status":"CONFIRMED","guest_name":"R**** S*****","guest_email":"r****@example.com","guest_phone":"******3210"}
 
 curl -s -w '\nHTTP %{http_code}\n' "$API/bookings/$BOOKING_ID" -H "Authorization: Bearer $GUEST2"
+# {"status":2100006,"message":"booking not found","errors":null,"data":null,"request_id":"..."}
 # HTTP 404
 ```
 
@@ -286,26 +332,39 @@ curl -s -w '\nHTTP %{http_code}\n' "$API/bookings/$BOOKING_ID" -H "Authorization
 
 ```sh
 curl -s -X POST "$API/bookings/$BOOKING_ID/cancel" -H "Authorization: Bearer $GUEST" -H "$JSON" \
-  -d '{"reason": "plans changed"}' | jq '.data | {status, refund, cancelled_at}'
-# {"status": "CANCELLED", "refund": {"amount": "7000.00", "percent": "100.00", "status": "REFUNDED"}, "cancelled_at": "..."}
+  -d '{"reason": "plans changed"}' | jq -c '.data | {status, refund, cancelled_at}'
+# {"status":"CANCELLED","refund":{"amount":"7000.00","percent":"100.00","status":"REFUNDED"},"cancelled_at":"2026-10-26T17:21:52.093668Z"}
 
 curl -s -X POST "$API/bookings/$BOOKING2_ID/cancel" -H "Authorization: Bearer $GUEST" -H "$JSON" \
-  -d '{}' | jq '.data | {status, refund}'
-# {"status": "CANCELLED", "refund": {"amount": "0.00", "percent": "0.00", "status": "NONE"}}
+  -d '{}' | jq -c '.data | {status, refund}'
+# {"status":"CANCELLED","refund":{"amount":"0.00","percent":"0.00","status":"NONE"}}
 
-# Cancelling again is an invalid transition: HTTP 409, status 2105002
-curl -s -X POST "$API/bookings/$BOOKING_ID/cancel" -H "Authorization: Bearer $GUEST" -H "$JSON" -d '{}' | jq '{status, message}'
+# Cancelling again is an invalid transition
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$API/bookings/$BOOKING_ID/cancel" -H "Authorization: Bearer $GUEST" -H "$JSON" -d '{}'
+# {"status":2105002,"message":"Cannot cancel a booking that is CANCELLED","errors":null,"data":null,"request_id":"..."}
+# HTTP 409
 ```
+
+Cancelling after the check-in time gets 422 `2105007`.
 
 **9. Search again.** Both holds are released, so all five rooms are available again.
 
 ```sh
-curl -s "$API/discovery/search?city=Jaipur&check_in=2026-12-15&check_out=2026-12-17&guests=2" \
-  | jq '.data.items[0].offers[0].available_rooms'
+curl -s "$API/discovery/search?city=Jaipur&check_in=$CHECK_IN&check_out=$CHECK_OUT&guests=2" \
+  | jq --arg id "$PROPERTY_ID" '.data.items[] | select(.property_id == $id) | .offers[0].available_rooms'
 # 5
 ```
 
-An unpaid booking that is neither paid nor cancelled becomes `EXPIRED` after `BOOKING_HOLD_TTL_SECONDS` (900 by default). This happens when the scheduler's next run picks it up, or right away if someone tries to pay for it (409 `BOOKING_EXPIRED`). Either way, its rooms are released.
+An unpaid booking that is neither paid nor cancelled becomes `EXPIRED` after `BOOKING_HOLD_TTL_SECONDS` (900 by default). A payment attempt after that moment never charges: it expires the booking itself and answers 409 `2105003` (`BOOKING_EXPIRED`). The rooms go back on sale when the scheduler's expiry job releases the hold, which it does on its next run, so **within one scheduler interval (60 s) of the expiry**. Until then search and new bookings still count those rooms as taken (see [trade-offs](#what-i-would-do-with-more-time)).
+
+**Busy and slow requests.** Database work runs with `lock_timeout=2s` and `statement_timeout=5s`. A request that waits too long for a row another request holds (for example many guests booking the same nights at once) answers **409 `2100019`** "The resource is busy, please retry"; a statement that runs too long answers **503 `2100020`** "The request took too long, please retry". Both carry `Retry-After: 1`, change nothing, and are safe to retry, with the same Idempotency-Key where the endpoint takes one.
+
+**OPTIONS.** The API publishes its contract as OpenAPI (`/schema`, `/docs`) rather than through `OPTIONS`, so `OPTIONS` on an API route answers 405 `2100017` after authentication and rate limiting, like any other request:
+
+```sh
+curl -s -X OPTIONS "$API/bookings" -H "Authorization: Bearer $GUEST"
+# {"status":2100017,"message":"Method OPTIONS not allowed","errors":null,"data":null,"request_id":"..."}   HTTP 405
+```
 
 ### Endpoints
 
@@ -330,6 +389,8 @@ All paths are under `/hotel/v1`.
 | `GET /payments/{payment_id}` | GUEST, ADMIN | the paying guest |
 | `GET /schema`, `GET /docs` | public | OpenAPI 3 and Swagger UI |
 
+Any route that touches the database can also answer 409 `2100019` (busy) or 503 `2100020` (too slow), both with `Retry-After: 1`, and `OPTIONS` answers 405 (see the end of the walkthrough).
+
 ## Running tests
 
 The tests run on the host and use a local virtualenv. The container image is Python 3.13. The host venv also works on 3.12.
@@ -342,8 +403,11 @@ python3.13 -m venv .venv
 | Kind | Needs | Examples |
 |---|---|---|
 | Unit: domain, services against in-memory repositories and fakes, the shared library | nothing (Redis is always `fakeredis`) | `.venv/bin/pytest libs/hotel-commons/tests pricing booking/tests/test_state_machine.py booking/tests/test_booking_services.py` |
+| Architecture: module boundaries from the source's AST (`tests/architecture/`) | nothing | `.venv/bin/pytest -p no:django tests/architecture` |
+| Container config: entrypoint, compose ports, `scripts/bootstrap_env.py` (`tests/infra/`) | nothing | `.venv/bin/pytest tests/infra` |
 | DB: API and repository tests (`@pytest.mark.django_db`) | Postgres from docker compose | `./run-tests.sh catalog` |
-| Integration: end-to-end flow and concurrency races (`-m integration`) | Postgres from docker compose | `./run-tests.sh -m integration` |
+| Contract: the OpenAPI document validates with no warnings, and real responses match it (`tests/contract/`) | Postgres from docker compose | `./run-tests.sh tests/contract` |
+| Integration: end-to-end flows, the brief's edge cases over HTTP, concurrency races (`-m integration`) | Postgres from docker compose | `./run-tests.sh -m integration` |
 
 `./run-tests.sh` runs `docker compose up -d --wait postgres redis` and then `.venv/bin/pytest -q`, passing along any extra arguments:
 
@@ -353,7 +417,11 @@ python3.13 -m venv .venv
 ./run-tests.sh booking                # one app
 ```
 
-`pytest.ini` points at `hotel_booking_service.test_settings`. That module uses fixed test-only keys, forces `REDIS_URL=fakeredis://`, and connects to Postgres on `localhost:5432` with user and password `hotel`. pytest-django creates its own test database there, so the data of a running stack is not touched. The concurrency tests race 10 threads for the last room against real Postgres and assert exactly one winner and `reserved_rooms == 1`. They also race overlapping stays in both orders to show there is no deadlock.
+`pytest.ini` points at `hotel_booking_service.test_settings`. That module uses fixed test-only keys, forces `REDIS_URL=fakeredis://`, and connects to Postgres on `localhost:5432` with user and password `hotel`. pytest-django creates its own test database there, so the data of a running stack is not touched.
+
+The concurrency tests run real threads, each on its own Postgres connection, so their work commits and a fixture truncates the context tables afterwards:
+- `tests/integration/test_inventory_concurrency.py`: 10 threads race for the last room (exactly one winner, `reserved_rooms == 1`). Stays that share three nights race in both assignments over 20 rounds, and a hold races a release of an overlapping stay, with no deadlock or lock timeout allowed. Because one `SELECT ... ORDER BY stay_date FOR UPDATE` locks a stay's nights in a single fast statement, a lock-order regression rarely shows up as a real deadlock in a race, so a deterministic test also pins the generated SQL (`ORDER BY ... stay_date ASC FOR UPDATE`), and a negative control locks the shared nights in opposite directions to prove the harness turns a deadlock into a failure.
+- `tests/integration/test_booking_concurrency.py`: the races decided under the booking row lock. A payment races the expiry job (exactly one of CONFIRMED with one charge, or EXPIRED with none), a double-clicked cancel refunds once, two payments with different keys charge once, and 10 guests posting `/bookings` for the last room get one 201 and nine 409s. Removing `FOR UPDATE` from `BookingRepository.get_for_update` fails all three booking races.
 
 ## Architecture in brief
 
@@ -371,7 +439,8 @@ The service is a **modular monolith**: one Django project and one deployable, sp
 
 The design follows these rules:
 
-- **Boundaries.** An app imports another app only through its `public` package (facade, DTOs, events, enums). `booking` reaches catalog, pricing, inventory and payment through adapters in `booking/adapters/` that implement its own ports. The dependency graph is acyclic.
+- **Boundaries.** An app imports another app only through its `public` package (facade, DTOs, events, enums, and payment's published pay-request serializer). `booking` reaches catalog, pricing, inventory and payment through adapters in `booking/adapters/` that implement its own ports, and no `services/` package imports another app. The dependency graph is acyclic. `tests/architecture/test_module_boundaries.py` enforces all of this on every import statement, together with framework-free `domain/` and `interfaces/` packages, and fails on an app dependency that is not in the HLD §3.4 context map.
+- **Shared rules live once.** Contact validation (Indian mobile numbers, email normalisation) is `hotel_commons/domain/validation.py`, used by the catalog, booking and payment domains.
 - **Wiring.** `container.py` is the only place that chooses implementations. Unit tests build the same services from in-memory repositories and fakes.
 - **One database, one schema per context.** PostgreSQL holds the schemas `catalog`, `inventory`, `discovery`, `booking` and `payment` (pricing has no tables). Everything goes through one connection, so book → hold and pay → charge → confirm stay single ACID transactions. There are no foreign keys across schemas; references between contexts are UUIDv7 columns. This lets an app move to its own service and database later ([HLD §14](docs/HLD.md#14-path-to-microservices)).
 
@@ -380,10 +449,11 @@ hotel-booking-service/
 ├── hotel_booking_service/    # project: settings.py, test_settings.py, urls.py (all routes), wsgi/asgi
 ├── catalog/  inventory/  pricing/  discovery/  booking/  payment/
 ├── libs/hotel-commons/       # shared library: hotel_commons/ + tests/
-├── tests/                    # cross-app integration tests (end-to-end flow, concurrency)
-├── scripts/encrypted_request.py
+├── tests/                    # cross-app tests: integration/ (flows, edge cases, races), contract/ (OpenAPI),
+│                             # architecture/ (module boundaries), infra/ (container config, bootstrap_env)
+├── scripts/                  # encrypted_request.py (payload encryption demo), bootstrap_env.py (fresh local keys)
 ├── docker/                   # entrypoint.sh (app), scheduler.sh
-├── secrets/dev/              # DEV-ONLY RSA key, mounted read-only into the containers
+├── secrets/                  # dev/: DEV-ONLY RSA key; local/: bootstrap_env.py keys (git-ignored); mounted read-only
 ├── docs/                     # HLD.md, LLD.md
 ├── Dockerfile  docker-compose.yml  local_run.sh  run-tests.sh
 ├── requirements.txt  requirements-dev.txt  pytest.ini  conftest.py
@@ -438,11 +508,14 @@ Inventory is a row per room type per night: `inventory.room_night(room_type_id, 
 
 - **Holding rooms.** A hold runs `SELECT … FOR UPDATE` on the stay's nights **in date order**, checks availability, increments `reserved_rooms` and inserts the hold, all in one transaction. Locking in a fixed order means overlapping stays cannot deadlock. The `CHECK` makes overselling impossible even if application code is wrong.
 - **Booking transitions.** Pay, cancel and expire each lock the booking row first. A payment racing the expiry job, or a double-clicked cancel, is therefore decided under the lock. "Expired" means `now >= hold_expires_at` in code and in SQL alike.
-- **Expiry job.** The job handles one booking per transaction with `FOR UPDATE SKIP LOCKED`, so workers never block each other or new bookings.
-- **Fail fast.** `lock_timeout=2s` and `statement_timeout=5s` turn contention into a quick error instead of a queue.
+- **Expiry job.** The job handles one booking per transaction with `FOR UPDATE SKIP LOCKED`, so workers never block each other or new bookings. Each run works through batches until one comes back short (or its time budget is spent), skipping any booking that failed earlier in the same run.
+- **Expiry and availability (trade-off).** Booking and payment state never depend on the job: a payment after `hold_expires_at` expires the booking itself and charges nothing. Availability does: inventory keeps a lapsed hold's rooms reserved until the job releases them, so they return to search and to new bookings **within one scheduler interval (about 60 s)** after the hold expires. Reclaiming lapsed holds inside `hold()` would close that gap at the cost of a cross-context write on the hot path.
+- **Fail fast.** `lock_timeout=2s` and `statement_timeout=5s` (`DB_LOCK_TIMEOUT_MS`, `DB_STATEMENT_TIMEOUT_MS`; 0 switches one off) turn contention into a quick, retryable answer instead of a queue: a lock wait that times out is **409 `2100019` RESOURCE_BUSY**, a statement that times out is **503 `2100020` SERVICE_TIMEOUT**, both with `Retry-After: 1` and logged as warnings, not 500s. `migrate` runs with both off (`docker/entrypoint.sh`), so a long index build is not cancelled at start-up.
 - **Missing rows.** A hold first creates any missing night rows (`ON CONFLICT DO NOTHING`), and the scheduler keeps the 365-day horizon provisioned.
 - **Committed outcomes.** A declined payment or an expired hold is committed first, and the service then *returns* that outcome (402 or 409 with `data`). The service never raises after a state change, so the change is never rolled back.
-- **Payment idempotency has four layers.** (1) Redis `SET NX` on `Idempotency-Key`, scoped per user and endpoint and checked against an HMAC fingerprint of the request. (2) A durable replay check that finds an earlier charge by its key, so a retry after Redis forgets the key still returns the original 200. (3) A unique `idempotency_key` on payment and refund rows. (4) The same key passed to the gateway.
+- **Payment idempotency has four layers.** (1) Redis `SET NX` on `Idempotency-Key`, scoped per user and endpoint and checked against an HMAC fingerprint of the request. (2) A durable replay check that finds an earlier charge by its key, so a retry after Redis forgets the key still returns the original 200; the payment row stores an HMAC-SHA256 fingerprint of the method and its details (`IDEMPOTENCY_FINGERPRINT_KEY`, never the card data), so the same key with a different body is 422 `IDEMPOTENCY_KEY_REUSED` here too. (3) A unique `idempotency_key` on payment and refund rows. (4) The same key passed to the gateway.
+- **Booking create is durably idempotent.** A create sent with `Idempotency-Key` stores the key on the booking under a unique `(guest_id, idempotency_key)`, so a retry returns the first booking even when Redis was down or has forgotten the key, and a concurrent retry that loses the race rolls its own hold back. Cancel and the catalog writes are idempotent through Redis only (best effort while Redis is down; cancelling twice is a 409 anyway).
+- **Gateway calls inside the transaction (trade-off, [HLD §15](docs/HLD.md#15-trade-offs-and-future-work)).** The charge (pay) and the refund (cancel) run inside the booking's unit of work, under its row lock (and, on cancel, the stay's night locks). With the in-process mock gateway this is simple and atomic, and a failed refund rolls the whole cancel back. With a real gateway the lock is held for the network round trip and a rollback after a successful call would leave no local trace of the money moved, so the plan is an INITIATED record committed first, the call outside the lock, and an outbox or webhook to settle it.
 
 The rejected alternatives were per-room exclusion constraints (guests book room types, not room numbers), optimistic version columns (clients retry on popular dates) and Redis locks (a second source of truth). See [HLD §9](docs/HLD.md#9-concurrency-and-consistency).
 
@@ -472,7 +545,7 @@ Booking transitions live in one table, `TRANSITIONS` in `booking/domain/state_ma
 
 - **What is encrypted.** Guest name, email and phone, owner contact details, and UPI VPA or wallet phone are stored as AES-256-GCM ciphertext (`ENC_<key-id>:<base64>`) by `EncryptedTextField`, which covers every write path, log tables included.
 - **Column binding.** Associated data (`<PI type>|<column>`) ties each ciphertext to its column. The key id in the prefix allows key rotation.
-- **Lookups.** Equality lookups use a keyed HMAC blind index (`contact_email_hash`, which is unique). Owner-facing screens read `masked_*` companion columns without decrypting.
+- **Lookups.** Equality lookups use a keyed HMAC blind index (`contact_email_hash`, which is unique). `masked_*` companion columns are written with every save, for reads that must not decrypt (SQL, support and BI tooling); the API itself decrypts and masks in the serializer for anyone but the subject and ADMIN.
 - **Cards.** Card number and CVV are never stored: only the brand and last four digits survive (`VISA •••• 4242`).
 - **Logs.** Services log ids only. Commands and DTOs hide PII from `repr`, and a logging filter redacts emails, phone numbers and card numbers as a safety net.
 - **Stored replies.** Idempotent responses stored in Redis are encrypted with the same cipher.
@@ -491,7 +564,7 @@ Booking transitions live in one table, `TRANSITIONS` in `booking/domain/state_ma
 | To add | Change | Untouched |
 |---|---|---|
 | A search filter | A `SearchFilter` subclass with `@register_filter` in `discovery/domain/filters.py`: an `INDEX` filter returns a `Predicate` on the listing; an `OFFER` filter implements `matches()` on a priced offer. A filter with a new query parameter also adds it to `SearchQuerySerializer` and `SearchCriteria` | `SearchService`, the view, the repository |
-| A payment method | A `PaymentMethod` member (`payment/public/enums.py`), a `PaymentMethodHandler` in `payment/domain/methods.py` registered in `payment/container.py`, and a details serializer in `BookingPaymentSerializer` | `ChargeService`, `PayBookingService` |
+| A payment method | A `PaymentMethod` member (`payment/public/enums.py`), a `PaymentMethodHandler` in `payment/domain/methods.py` registered in `payment/container.py`, and its details serializer in `payment/public/serializers.py` (`PaymentMethodRequestSerializer`, which booking's pay body extends) | `ChargeService`, booking |
 | A pricing strategy | A `PricingStrategyCode` member (`catalog/public/enums.py`) and a `PricingStrategy` in `pricing/domain/strategies.py`, registered in `build_default_registry()` | `PricingService`, discovery, booking |
 | A cancellation policy | A `CancellationPolicyCode` member and an entry in `DEFAULT_CANCELLATION_POLICIES` (a new `TieredCancellationPolicy` tier table or a new `CancellationPolicy` class) in `booking/domain/cancellation.py` | `CancelBookingService` |
 | A booking type | A `BookingType` member (`booking/enums.py`) and a `BookingTypePolicy` in `booking/domain/booking_types.py` (initial status, whether online payment is needed, hold expiry) | the booking services |
@@ -530,9 +603,9 @@ Brief §8 lists authentication as out of scope. Identity here is therefore delib
 | **JWT identity and roles** | HS256 tokens with `iss`, `aud`, `exp`, `nbf`, `sub` and `roles`, verified by middleware. The algorithm is pinned, every claim is required, the key must be at least 32 bytes and the `sub` format is checked. A `TokenVerifier` protocol leaves room for RS256/JWKS behind a gateway. Roles are checked per action. | always on; `/dev/tokens` only when `ENVIRONMENT=local` |
 | **IDOR protection** | Views declare `idor_rules` per action: the resource, where its id comes from, and which relationship counts (`guest` or `owner`). Ownership is read from Postgres through resolvers each app registers. A failed check returns 404. A user who is both guest and owner can view a stranger's booking at their own property but cannot pay for or cancel it. | always on |
 | **Field-level security** | `on_behalf_of_user_id` and `guest_id` are ADMIN-only on write (403 for anyone else). Guest PII is plain for the guest and ADMIN and masked for owners. `gateway_txn_id` is shown only to ADMIN. | always on |
-| **API payload encryption** | Hybrid RSA-OAEP-256 (3072-bit) and AES-256-GCM. The client encrypts the body with a fresh AES key and wraps that key with the server's public key (`X-Encrypted-Key`), adding `X-Payload-Encryption: v1` and `X-Payload-Timestamp`. The associated data binds method, path, timestamp and direction. Each wrapped key is accepted once (a Redis replay guard), and the response is encrypted with the same AES key. Health, docs, schema, public key and dev tokens always bypass it. | `API_ENCRYPTION_MODE=off \| optional \| enforced` (`optional` in `.env.example`: plaintext and encrypted both work) |
+| **API payload encryption** | Hybrid RSA-OAEP-256 (3072-bit) and AES-256-GCM. The client encrypts the body with a fresh AES key and wraps that key with the server's public key (`X-Encrypted-Key`), adding `X-Payload-Encryption: v1` and `X-Payload-Timestamp`. The associated data binds direction, method, path with its query string, and timestamp, and every method but GET, HEAD and OPTIONS must carry a sealed body. Each wrapped key is accepted once (a Redis replay guard that outlives the whole ±300 s timestamp window), and the response is encrypted with the same AES key. Health, docs, schema, public key and dev tokens always bypass it. | `API_ENCRYPTION_MODE=off \| optional \| enforced` (`optional` in `.env.example`: plaintext and encrypted both work) |
 | **Rate limiting** | A sliding-window log in Redis, run as one atomic Lua script on Redis server time and keyed by user, or by client IP when anonymous. Per-scope limits per minute: default 120, search 60, catalog writes 30, booking writes 20, payments 10, encrypted requests 300 per IP. Over the limit it returns 429 with `Retry-After` and `X-RateLimit-*` headers. If Redis is down it fails open, except for payments, which fail closed. The client IP comes from `REMOTE_ADDR` unless `TRUSTED_PROXY_COUNT` says how many proxy hops to trust. | `RATE_LIMIT_ENABLED=false` |
-| **Idempotency** | `@idempotent(scope)` on create booking, pay (required) and cancel, and optionally on catalog writes. It replays stored responses below 500, returns 409 while the first request is in progress and 422 on key reuse with a different body, and releases the key on a 5xx. If Redis is unreachable the view still runs, and the database's unique keys keep payments single. | always on |
+| **Idempotency** | `@idempotent(scope)` on create booking, pay (required) and cancel, and optionally on catalog writes. It replays stored responses below 500, returns 409 while the first request is in progress and 422 on key reuse with a different body, and releases the key on a 5xx or a retryable answer (busy, timeout, rate limit). If Redis is unreachable the view still runs; the keys stored with the write keep payments, refunds and booking creates single, and the other scopes are best effort. | always on |
 
 To change a toggle, put it in a `.env` file in the repository root. Compose loads `.env` after `.env.example`, so it overrides it, and git ignores it. Then recreate the containers:
 
@@ -573,7 +646,7 @@ Before the gateway is called, the method handlers check the details and answer 4
 The repository commits secrets **for local runs only**, so `docker compose up` works without setup:
 
 - `.env.example` holds DEV-ONLY values: the Django secret key, JWT signing key, PII key ring, blind-index key and idempotency fingerprint key.
-- `secrets/dev/api_rsa_private.pem` is a DEV-ONLY RSA-3072 key for payload encryption. Compose mounts it read-only at `/app/secrets/dev`.
+- `secrets/dev/api_rsa_private.pem` is a DEV-ONLY RSA-3072 key for payload encryption. Compose mounts `secrets/` read-only at `/app/secrets`.
 
 Because they are committed, these keys are public and protect nothing. Several safeguards keep them out of real deployments:
 
@@ -581,16 +654,20 @@ Because they are committed, these keys are public and protect nothing. Several s
 - `.dockerignore` keeps env files and `secrets/` out of every image layer.
 - `.gitignore` ignores `.env` and everything under `secrets/` except `secrets/dev/`.
 
-A real deployment injects its own values through the environment and mounts its own RSA key at `API_RSA_PRIVATE_KEY_PATH`. To use fresh keys locally, put new values in `.env`. Each key is base64 of 32 random bytes:
+A real deployment injects its own values through the environment and mounts its own RSA key at `API_RSA_PRIVATE_KEY_PATH`. To use fresh keys locally, run `scripts/bootstrap_env.py`:
 
 ```sh
-python3 -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())"
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out secrets/dev/api_rsa_private.pem
+.venv/bin/python scripts/bootstrap_env.py            # refuses to overwrite an existing .env or key
+.venv/bin/python scripts/bootstrap_env.py --force    # replace them (an existing APP_PORT is kept)
+docker compose down -v && ./local_run.sh             # PII written with the old keys cannot be read any more
 ```
+
+It writes a `.env` (mode 600) with a new Django secret key, JWT signing key, one-key PII ring, blind-index key and idempotency fingerprint key (base64 of 32 random bytes each), and a new RSA-3072 key at `secrets/local/api_rsa_private.pem`, which compose mounts read-only with the rest of `secrets/` at `/app/secrets`. Both paths are git-ignored. Compose still reads the other settings from `.env.example`.
 
 ## What I would do with more time
 
-- **Move the gateway call out of the booking transaction.** Today it runs inside the transaction, which is simple and atomic with a mock. With a real gateway, I would create a pending payment, commit, call out, and confirm through a webhook or an outbox, so database transactions stay short.
+- **Move the gateway call out of the booking transaction.** Today the charge and the refund run inside the booking's transaction and row lock ([HLD §15](docs/HLD.md#15-trade-offs-and-future-work)), which is simple and atomic with a mock. With a real gateway, I would commit an INITIATED payment or refund first, call out without holding locks, and settle it through a webhook or an outbox with a reconciliation job, so database transactions stay short and no charge is ever untracked.
+- **Reclaim lapsed holds at once.** Expired holds return to sale within one scheduler interval. Releasing them inside `hold()` and ignoring them in availability would make that immediate.
 - **Precompute search.** Search computes availability and price on every request, which is fine at this scale. At scale I would add precomputed availability, cached quotes and a search engine behind the same `ListingRepository` port.
 - **Replace synchronous in-process events.** Today they trade decoupling for atomicity inside the monolith. Next steps are a transactional outbox and a broker. Discovery then becomes eventually consistent.
 - **Product features:** per-channel rate plans and inventory, partial cancellation, notifications, OpenTelemetry tracing and admin tooling.

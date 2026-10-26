@@ -1,8 +1,10 @@
 """DRF exception handler (``REST_FRAMEWORK["EXCEPTION_HANDLER"]``) answering every client error with the
 error envelope (LLD §3.9).
 
-``AppError`` keeps its own StatusCode; DRF and Django exceptions map to the common codes. Anything else
-returns ``None``, so DRF re-raises it and ``ExceptionHandlingMiddleware`` answers 500 INTERNAL_ERROR.
+``AppError`` keeps its own StatusCode; DRF and Django exceptions map to the common codes; a lock or
+statement timeout maps to 409 RESOURCE_BUSY / 503 SERVICE_TIMEOUT with Retry-After (``hotel_commons.db.errors``).
+Anything else returns ``None``, so DRF re-raises it and ``ExceptionHandlingMiddleware`` answers 500
+INTERNAL_ERROR.
 """
 
 import logging
@@ -18,7 +20,8 @@ from rest_framework.settings import api_settings
 
 from hotel_commons.api.response import error_body
 from hotel_commons.consts import RETRY_AFTER_HEADER
-from hotel_commons.exceptions import AppError
+from hotel_commons.db.errors import retryable_database_error
+from hotel_commons.exceptions import AppError, RetryLater, TooManyRequests
 from hotel_commons.status_code import (
     FORBIDDEN,
     METHOD_NOT_ALLOWED,
@@ -36,6 +39,9 @@ def envelope_exception_handler(exc: Exception, context: Mapping[str, Any]) -> Re
     """The envelope Response for ``exc``, or None to let the exception reach the middleware (500)."""
     if isinstance(exc, AppError):
         return _app_error(exc)
+    retryable = retryable_database_error(exc)
+    if retryable is not None:
+        return _app_error(retryable)
     if isinstance(exc, exceptions.ValidationError):
         return _envelope(VALIDATION_FAILED, errors=_field_errors(exc.detail))
     if isinstance(exc, exceptions.NotAuthenticated | exceptions.AuthenticationFailed):
@@ -59,11 +65,25 @@ def envelope_exception_handler(exc: Exception, context: Mapping[str, Any]) -> Re
 
 
 def _app_error(exc: AppError) -> Response:
-    if exc.http_status >= 500:
+    log_app_error(exc)
+    return Response(error_body(exc.status_code, exc.message, exc.errors), status=exc.http_status,
+                    headers=retry_after_headers(exc))
+
+
+def log_app_error(exc: AppError) -> None:
+    """A 5xx is logged as an error with its traceback; a lock or statement timeout (expected under load) as a
+    warning; a rate limit, like any other client error, not at all."""
+    if isinstance(exc, TooManyRequests):
+        return
+    if isinstance(exc, RetryLater):
+        logger.warning("Request failed with retryable status code %s", exc.status_code.code)
+    elif exc.http_status >= 500:
         logger.error("Request failed with status code %s", exc.status_code.code, exc_info=exc)
-    retry_after = getattr(exc, "retry_after_seconds", None)
-    headers = {RETRY_AFTER_HEADER: str(retry_after)} if retry_after is not None else None
-    return Response(error_body(exc.status_code, exc.message, exc.errors), status=exc.http_status, headers=headers)
+
+
+def retry_after_headers(exc: AppError) -> dict[str, str] | None:
+    """The Retry-After header of a ``RetryLater`` (rate limit, lock or statement timeout), else None."""
+    return {RETRY_AFTER_HEADER: str(exc.retry_after_seconds)} if isinstance(exc, RetryLater) else None
 
 
 def _envelope(

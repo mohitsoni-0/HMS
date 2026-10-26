@@ -18,7 +18,8 @@ from booking.status_code import INVALID_BOOKING_REQUEST
 class BookingTypePolicy(ABC):
     booking_type: ClassVar[BookingType]
     initial_status: ClassVar[BookingStatus]
-    requires_online_payment: ClassVar[bool]
+    requires_online_payment: ClassVar[bool]  # whether POST /bookings/{id}/payments applies at all
+    confirms_hold_on_create: ClassVar[bool]  # whether the rooms are committed when the booking is made
 
     @abstractmethod
     def hold_expires_at(self, now: datetime, hold_ttl: timedelta) -> datetime | None:
@@ -31,6 +32,7 @@ class PrepaidBookingPolicy(BookingTypePolicy):
     booking_type = BookingType.PREPAID
     initial_status = BookingStatus.PENDING_PAYMENT
     requires_online_payment = True
+    confirms_hold_on_create = False
 
     def hold_expires_at(self, now: datetime, hold_ttl: timedelta) -> datetime | None:
         return now + hold_ttl
@@ -42,6 +44,7 @@ class PayAtPropertyBookingPolicy(BookingTypePolicy):
     booking_type = BookingType.PAY_AT_PROPERTY
     initial_status = BookingStatus.CONFIRMED
     requires_online_payment = False
+    confirms_hold_on_create = True
 
     def hold_expires_at(self, now: datetime, hold_ttl: timedelta) -> datetime | None:
         return None

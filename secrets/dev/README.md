@@ -15,3 +15,7 @@ Regenerate it with:
 ```sh
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out secrets/dev/api_rsa_private.pem
 ```
+
+The key is recognised by the SHA-256 fingerprint of its public half (`DEV_RSA_PUBLIC_KEY_SHA256` in
+`libs/hotel-commons/hotel_commons/settings/__init__.py`). If you regenerate this key, update that constant;
+settings refuse the fingerprinted key whenever `ENVIRONMENT` is not `local` and API encryption is on.

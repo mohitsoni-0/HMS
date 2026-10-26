@@ -12,3 +12,8 @@ from pricing.interfaces.ports import OccupancyPort
 class InventoryOccupancyAdapter(OccupancyPort):
     def occupancy(self, room_type_id: UUID, nights: Sequence[date]) -> Mapping[date, Decimal]:
         return get_inventory_api().occupancy(room_type_id, nights)
+
+    def occupancy_many(
+        self, room_type_ids: Sequence[UUID], nights: Sequence[date]
+    ) -> Mapping[UUID, Mapping[date, Decimal]]:
+        return get_inventory_api().occupancy_many(room_type_ids, nights)

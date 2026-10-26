@@ -246,6 +246,8 @@ def test_status_code_safe_render():
         ("LOG_MODEL_NOT_FOUND", 2100016, 500),
         ("METHOD_NOT_ALLOWED", 2100017, 405),
         ("NOT_FOUND", 2100018, 404),
+        ("RESOURCE_BUSY", 2100019, 409),
+        ("SERVICE_TIMEOUT", 2100020, 503),
     ],
 )
 def test_common_status_catalogue(name, code, http_status):
@@ -255,7 +257,7 @@ def test_common_status_catalogue(name, code, http_status):
 
 def test_common_status_codes_are_unique():
     catalogue = [value for value in vars(codes).values() if isinstance(value, StatusCode)]
-    assert len(catalogue) == 19
+    assert len(catalogue) == 21
     assert len({status.code for status in catalogue}) == len(catalogue)
     assert codes.SERVICE_CODE == 21
 
@@ -706,20 +708,6 @@ def test_validate_tolerates_settings_that_refuse_an_empty_secret_key(tmp_path):
     validate_security_settings(_SettingsWithoutSecretKey(**values))
 
 
-def test_validate_refuses_the_dev_rsa_key_only_when_encryption_is_on(tmp_path):
-    dev_dir = tmp_path / "secrets" / "dev"
-    dev_dir.mkdir(parents=True)
-    (dev_dir / "api_rsa_private.pem").write_bytes(b"dev-private-key")
-    (tmp_path / "keys").mkdir()
-    (tmp_path / "keys" / "rsa.pem").write_bytes(b"dev-private-key")  # a copy of the dev key is still the dev key
-    for path in ("secrets/dev/api_rsa_private.pem", str(tmp_path / "keys" / "rsa.pem")):
-        with pytest.raises(ImproperlyConfigured, match="API_RSA_PRIVATE_KEY_PATH"):
-            validate_security_settings(_config(tmp_path, API_RSA_PRIVATE_KEY_PATH=path))
-    validate_security_settings(_config(tmp_path, API_RSA_PRIVATE_KEY_PATH=path, API_ENCRYPTION_MODE="off"))
-    (tmp_path / "keys" / "rsa.pem").write_bytes(b"production-private-key")
-    validate_security_settings(_config(tmp_path))
-
-
 # --- base_settings (imported in a clean subprocess: it reads the environment at import) ----------------------
 
 _SETTINGS_PROBE = """
@@ -792,7 +780,7 @@ def test_base_settings_defines_the_contract(tmp_path):
         "hotel_commons",
     ]
     assert settings["db"] == [
-        "django.db.backends.postgresql",
+        "hotel_commons.db.backends.postgresql",
         60,
         True,
         False,
@@ -825,11 +813,33 @@ def test_base_settings_defines_the_contract(tmp_path):
     assert rest["DEFAULT_RENDERER_CLASSES"] == ["rest_framework.renderers.JSONRenderer"]
     assert rest["DEFAULT_PARSER_CLASSES"] == ["rest_framework.parsers.JSONParser"]
     assert rest["UNAUTHENTICATED_USER"] is None
+    assert rest["DEFAULT_METADATA_CLASS"] is None  # OPTIONS answers 405 instead of failing in DRF metadata
     spectacular = settings["spectacular"]
     assert spectacular["TITLE"] == "Hotel Booking Service API"
     assert spectacular["SERVE_PERMISSIONS"] == ["rest_framework.permissions.AllowAny"]
     assert (spectacular["SERVE_AUTHENTICATION"], spectacular["COMPONENT_SPLIT_REQUEST"]) == ([], True)
     assert settings["logging_root"] == "INFO"
+
+
+@pytest.mark.parametrize(
+    ("env", "options"),
+    [
+        ({"DB_LOCK_TIMEOUT_MS": "500", "DB_STATEMENT_TIMEOUT_MS": "9000"},
+         {"options": "-c lock_timeout=500 -c statement_timeout=9000"}),
+        ({"DB_LOCK_TIMEOUT_MS": "0"}, {"options": "-c statement_timeout=5000"}),
+        ({"DB_LOCK_TIMEOUT_MS": "0", "DB_STATEMENT_TIMEOUT_MS": "0"}, {}),  # how docker/entrypoint.sh migrates
+    ],
+)
+def test_base_settings_database_timeouts_come_from_the_environment(tmp_path, env, options):
+    result = _run_settings_probe(tmp_path, **env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["db"][4] == options
+
+
+def test_base_settings_refuses_a_negative_database_timeout(tmp_path):
+    result = _run_settings_probe(tmp_path, DB_STATEMENT_TIMEOUT_MS="-1")
+    assert result.returncode != 0
+    assert "DB_STATEMENT_TIMEOUT_MS must be >= 0" in result.stderr
 
 
 def test_base_settings_import_defers_missing_keys_to_startup_validation(tmp_path):

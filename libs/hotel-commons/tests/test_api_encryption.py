@@ -5,6 +5,7 @@ minimal Django itself; under the project settings it only overrides the encrypti
 3072-bit key is generated once for the module and served through ``API_RSA_PRIVATE_KEY_PATH``.
 """
 
+import hashlib
 import json
 import time
 
@@ -20,6 +21,10 @@ if not settings.configured:
         INSTALLED_APPS=["rest_framework"],
         REDIS_URL="fakeredis://",
         RATE_LIMIT_ENABLED=True,
+        RATE_LIMIT_POLICIES={
+            "default": {"limit": 120, "window_seconds": 60, "fail_open": True},
+            "encrypted": {"limit": 300, "window_seconds": 60, "fail_open": True},
+        },
         TRUSTED_PROXY_COUNT=0,
         API_ENCRYPTION_MODE="optional",
         API_ENCRYPTION_BYPASS_PATHS=frozenset(),
@@ -41,12 +46,14 @@ from django.http import HttpRequest, HttpResponse, JsonResponse  # noqa: E402
 from django.test import RequestFactory, override_settings  # noqa: E402
 
 from hotel_commons.exceptions import ValidationFailed  # noqa: E402
-from hotel_commons.redis.client import get_redis  # noqa: E402
+from hotel_commons.redis.client import get_redis, redis_key  # noqa: E402
 from hotel_commons.security import api_crypto  # noqa: E402
 from hotel_commons.security.api_crypto import (  # noqa: E402
     ALGORITHM,
+    MAX_CLOCK_SKEW_SECONDS,
     HybridPayloadCipher,
     HybridPayloadClient,
+    aad_target,
     get_payload_cipher,
     payload_aad,
 )
@@ -170,6 +177,31 @@ def test_aad_strings_follow_the_wire_format():
     assert payload_aad("res", "GET", API_PATH, 5) == f"v1|res|GET|{API_PATH}|5"
 
 
+def test_aad_target_appends_the_query_string_only_when_present():
+    assert aad_target(API_PATH, "") == API_PATH
+    assert aad_target(API_PATH, "property_id=a&page=2") == f"{API_PATH}?property_id=a&page=2"
+
+
+def test_client_binds_the_query_string_into_the_aad(private_key_pem, client):
+    cipher = HybridPayloadCipher(private_key_pem)
+    encrypted = client.encrypt_request("POST", f"{API_PATH}?property_id=a", {"rooms": 1})
+    aes_key = cipher.unwrap_key(encrypted.headers["X-Encrypted-Key"])
+
+    assert encrypted.path == f"{API_PATH}?property_id=a"
+    aad = payload_aad("req", "POST", f"{API_PATH}?property_id=a", encrypted.timestamp)
+    assert json.loads(cipher.decrypt(aes_key, encrypted.body["payload"], aad=aad)) == {"rooms": 1}
+    without_query = payload_aad("req", "POST", API_PATH, encrypted.timestamp)
+    with pytest.raises(ValidationFailed):
+        cipher.decrypt(aes_key, encrypted.body["payload"], aad=without_query)
+
+
+@pytest.mark.parametrize(("method", "sealed"), [("GET", False), ("HEAD", False), ("POST", True), ("DELETE", True)])
+def test_client_seals_an_empty_object_for_methods_that_need_a_body(client, method, sealed):
+    encrypted = client.encrypt_request(method, API_PATH, None)
+
+    assert (encrypted.body is not None) is sealed
+
+
 def test_fresh_nonce_per_encryption(private_key_pem):
     cipher = HybridPayloadCipher(private_key_pem)
     key = bytes(range(32))
@@ -225,6 +257,52 @@ def test_round_trip_request_and_response(middleware, client):
     assert envelope["data"] == {"method": "POST", "received": {"guest": "Rahul", "rooms": 2}}
 
 
+def test_query_string_round_trip(middleware, client):
+    encrypted, response = _send_encrypted(middleware, client, "GET", f"{API_PATH}?property_id=a")
+
+    assert response.status_code == 200
+    assert client.decrypt_response(encrypted, json.loads(response.content))["data"]["method"] == "GET"
+
+
+def test_tampered_query_string_rejected(middleware, client):
+    encrypted = client.encrypt_request("POST", f"{API_PATH}?property_id=a", {"rooms": 1})
+
+    response = _send(
+        middleware, "POST", f"{API_PATH}?property_id=b", headers=encrypted.headers, body=encrypted.body
+    )
+
+    assert response.status_code == 400
+    assert _status(response) == PAYLOAD_DECRYPTION_FAILED.code
+    assert middleware.seen == []
+
+
+def test_tampered_query_string_on_a_get_gives_a_response_the_client_refuses(middleware, client):
+    encrypted = client.encrypt_request("GET", f"{API_PATH}?property_id=a", None)
+
+    response = _send(middleware, "GET", f"{API_PATH}?property_id=b", headers=encrypted.headers)
+
+    with pytest.raises(ValidationFailed):
+        client.decrypt_response(encrypted, json.loads(response.content))
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+def test_stripped_body_rejected_for_methods_that_need_one(middleware, client, method):
+    encrypted = client.encrypt_request(method, API_PATH, {"reason": "plans changed"})
+
+    response = _send(middleware, method, API_PATH, headers=encrypted.headers)
+
+    assert response.status_code == 400
+    assert _status(response) == PAYLOAD_DECRYPTION_FAILED.code
+    assert middleware.seen == []
+
+
+def test_post_without_a_body_is_sent_as_a_sealed_empty_object(middleware, client):
+    encrypted, response = _send_encrypted(middleware, client, "POST", API_PATH)
+
+    assert response.status_code == 200
+    assert client.decrypt_response(encrypted, json.loads(response.content))["data"]["received"] == {}
+
+
 def test_get_with_headers_and_empty_body_encrypts_the_response(middleware, client):
     encrypted, response = _send_encrypted(middleware, client, "GET", API_PATH)
 
@@ -276,6 +354,15 @@ def test_replayed_wrapped_key_rejected(middleware, client):
     assert len(middleware.seen) == 1
 
 
+def test_replay_guard_outlives_the_accepted_timestamp_window(middleware, client):
+    """A timestamp is accepted from ts - skew to ts + skew, so the claimed key must live at least 2 x skew."""
+    encrypted, response = _send_encrypted(middleware, client, "POST", API_PATH, {"rooms": 1})
+    guard_key = redis_key("enc", "v1", hashlib.sha256(encrypted.headers["X-Encrypted-Key"].encode()).hexdigest())
+
+    assert response.status_code == 200
+    assert get_redis().ttl(guard_key) > 2 * MAX_CLOCK_SKEW_SECONDS
+
+
 def test_replay_guard_fails_open_when_redis_is_down(middleware, client, monkeypatch):
     from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -294,6 +381,16 @@ def test_stale_timestamp_rejected(middleware, private_key_pem, skew_seconds):
     skewed = HybridPayloadClient(_public_pem(private_key_pem), clock=lambda: time.time() + skew_seconds)
 
     _, response = _send_encrypted(middleware, skewed, "POST", API_PATH, {"rooms": 1})
+
+    assert response.status_code == 400
+    assert _status(response) == PAYLOAD_DECRYPTION_FAILED.code
+
+
+def test_overlong_timestamp_rejected_without_an_error(middleware, client):
+    encrypted = client.encrypt_request("POST", API_PATH, {"rooms": 1})
+    headers = {**encrypted.headers, "X-Payload-Timestamp": "9" * 5000}
+
+    response = _send(middleware, "POST", API_PATH, headers=headers, body=encrypted.body)
 
     assert response.status_code == 400
     assert _status(response) == PAYLOAD_DECRYPTION_FAILED.code
@@ -382,6 +479,28 @@ def test_encrypted_requests_are_rate_limited_per_ip_before_rsa_work(encryption_s
     assert response["Retry-After"] == "7"
     assert _status(response) == RATE_LIMITED.code
     assert limiter.subjects == ["encrypted:ip:127.0.0.1"]
+
+
+def test_encrypted_rate_limit_follows_the_encrypted_policy_setting(encryption_settings, client):
+    from hotel_commons.middlewares.api_encryption import ApiEncryptionMiddleware
+    from hotel_commons.ratelimit.interfaces import RateLimitDecision
+
+    policies = []
+
+    class RecordingLimiter:
+        def hit(self, subject, policy):
+            policies.append(policy)
+            return RateLimitDecision(allowed=True, limit=policy.limit, remaining=1, retry_after_seconds=0)
+
+    instance = ApiEncryptionMiddleware(lambda request: JsonResponse({}), rate_limiter=RecordingLimiter())
+    tightened = {
+        "default": {"limit": 120, "window_seconds": 60, "fail_open": True},
+        "encrypted": {"limit": 30, "window_seconds": 60, "fail_open": False},
+    }
+    with override_settings(RATE_LIMIT_POLICIES=tightened):
+        _send_encrypted(instance, client, "POST", API_PATH, {"rooms": 1})
+
+    assert [(p.scope, p.limit, p.window_seconds, p.fail_open) for p in policies] == [("encrypted", 30, 60, False)]
 
 
 # --- public key view ------------------------------------------------------------------------------------------

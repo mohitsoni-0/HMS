@@ -56,8 +56,13 @@ class RoomType:
 
     @property
     def name_key(self) -> str:
-        """The name as the uniqueness rule compares it: case-insensitive, like ``Lower(name)`` in the database."""
-        return self.name.lower()
+        """The name as the uniqueness rule compares it: runs of whitespace as one space, then ``casefold()``.
+
+        Case folding is at least as strict as PostgreSQL's ``LOWER(name)`` on the unique constraint for real
+        names ("ΟΔΟΣ" and "οδοσ" collide here too). The constraint stays the source of truth: the repository
+        maps any violation the domain did not catch to Conflict(DUPLICATE_ROOM_TYPE_NAME).
+        """
+        return " ".join(self.name.split()).casefold()
 
 
 def _require_length(field_name: str, value: str, minimum: int, maximum: int) -> None:

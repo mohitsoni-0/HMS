@@ -21,6 +21,10 @@ class CatalogAPI:
         """The user owning the account, or None when there is no such account."""
         return self._queries.owner_user_id(account_id)
 
+    def known_amenity_codes(self) -> frozenset[str]:
+        """Codes of the active amenities (cached for ``AMENITY_CODES_CACHE_SECONDS``)."""
+        return self._queries.known_amenity_codes()
+
 
 def get_catalog_api() -> CatalogAPI:
     from catalog import container

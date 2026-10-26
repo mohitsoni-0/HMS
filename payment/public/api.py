@@ -1,10 +1,14 @@
 """``PaymentAPI``, the facade other contexts call (LLD §9.6). It speaks DTOs and ``Money``, never entities.
 
 Booking charges through it (its replay check uses ``find_by_idempotency_key``) and refunds on cancellation;
-a refund the gateway rejects raises ``UpstreamFailure(REFUND_FAILED)``.
+a refund the gateway rejects raises ``UpstreamFailure(REFUND_FAILED)``. An idempotency key answers only for
+the request it was first used with: reusing it with another method or other details raises
+``BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED)``.
 """
 
+from collections.abc import Mapping
 from functools import lru_cache
+from typing import Any
 from uuid import UUID
 
 from payment import container
@@ -21,12 +25,20 @@ class PaymentAPI:
         self._refunds = refunds
         self._queries = queries
 
-    def find_by_idempotency_key(self, key: str) -> PaymentDTO | None:
-        payment = self._queries.find_by_idempotency_key(key)
+    def find_by_idempotency_key(
+        self, key: str, *, method: str | None = None, method_details: Mapping[str, Any] | None = None
+    ) -> PaymentDTO | None:
+        """The payment made with ``key``, or None. When ``method`` (and ``method_details``) are given and the
+        payment was made for another request, BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED)."""
+        payment = self._charges.find_by_idempotency_key(key, method=method, method_details=method_details)
         return None if payment is None else to_payment_dto(payment)
 
     def charge(self, command: ChargeCommand) -> PaymentDTO:
-        """The payment for the command's key: SUCCEEDED or FAILED (a decline is returned, not raised)."""
+        """The payment for the command's key: SUCCEEDED or FAILED (a decline is returned, not raised).
+
+        A key already used for another method or other details raises
+        BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED) instead of returning that payment.
+        """
         return to_payment_dto(self._charges.charge(command))
 
     def refund(self, command: RefundCommand) -> RefundResultDTO:

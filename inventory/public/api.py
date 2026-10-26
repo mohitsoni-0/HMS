@@ -46,6 +46,14 @@ class InventoryAPI:
     def occupancy(self, room_type_id: UUID, dates: Sequence[date]) -> dict[date, Decimal]:
         return self._service.occupancy(room_type_id, dates)
 
+    def occupancy_many(self, room_type_ids: Sequence[UUID], dates: Sequence[date]) -> dict[UUID, dict[date, Decimal]]:
+        """Room type -> night -> occupancy (0..1) for every requested room type and night, in one query."""
+        return self._service.occupancy_many(room_type_ids, dates)
+
+    def booking_window(self) -> DateRange:
+        """``[today, today + INVENTORY_HORIZON_DAYS]`` as a stay range: the stays ``hold`` accepts."""
+        return self._service.booking_window()
+
 
 def get_inventory_api() -> InventoryAPI:
     from inventory import container

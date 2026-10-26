@@ -3,7 +3,8 @@
 A handler validates the raw details of its method and returns the masked instrument plus the transient
 gateway payload. Errors name the offending field, never its value:
 ``ValidationFailed(INVALID_PAYMENT_DETAILS, reason="card_number")`` renders "Invalid card_number". Adding a
-method is a new handler and enum member; the charge service does not change.
+method is a new handler, enum member and details serializer in ``payment.public.serializers``; the charge
+service and the callers do not change.
 """
 
 import re
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Final
 
 from hotel_commons.domain.clock import Clock
+from hotel_commons.domain.validation import is_indian_mobile
 from hotel_commons.exceptions import ValidationFailed
 
 from payment.domain.instrument import ParsedInstrument, PaymentInstrument
@@ -26,7 +28,6 @@ _CARD_NUMBER: Final = re.compile(r"[0-9]{12,19}")
 _CARD_NUMBER_SEPARATORS: Final = re.compile(r"[ -]")
 _DIGITS: Final = re.compile(r"[0-9]+")
 _VPA: Final = re.compile(r"[A-Za-z0-9._-]{2,256}@[A-Za-z]{2,64}")
-_INDIAN_MOBILE: Final = re.compile(r"[6-9][0-9]{9}")
 _HOLDER_NAME_LENGTH: Final = range(2, 101)
 _VISIBLE_DIGITS: Final = 4
 _CARD_MASK: Final = "••••"
@@ -135,7 +136,7 @@ class WalletHandler(PaymentMethodHandler):
     def parse(self, details: Mapping[str, Any]) -> ParsedInstrument:
         provider = _wallet_provider(details.get("provider"))
         phone = _text(details, "phone")
-        if not _INDIAN_MOBILE.fullmatch(phone):
+        if not is_indian_mobile(phone):
             raise _invalid("phone")
         display = f"{provider.name} {_PHONE_MASK}{phone[-_VISIBLE_DIGITS:]}"
         payload = {"provider": provider.name, "phone": phone}

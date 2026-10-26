@@ -22,14 +22,16 @@ import json  # noqa: E402
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402
+from django.db import OperationalError  # noqa: E402
 from django.test import override_settings  # noqa: E402
+from psycopg.errors import LockNotAvailable  # noqa: E402
 from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: E402
 from rest_framework.response import Response  # noqa: E402
 from rest_framework.test import APIRequestFactory  # noqa: E402
 from rest_framework.views import APIView  # noqa: E402
 
 from hotel_commons.api.authentication import PrincipalAuthentication  # noqa: E402
-from hotel_commons.exceptions import Conflict  # noqa: E402
+from hotel_commons.exceptions import Conflict, RetryLater  # noqa: E402
 from hotel_commons.idempotency import decorators  # noqa: E402
 from hotel_commons.idempotency.decorators import idempotent  # noqa: E402
 from hotel_commons.idempotency.interfaces import BeginOutcome, IdempotencyStore, StoredResponse  # noqa: E402
@@ -42,6 +44,7 @@ from hotel_commons.status_code import (  # noqa: E402
     IDEMPOTENCY_KEY_INVALID,
     IDEMPOTENCY_KEY_REQUIRED,
     IDEMPOTENCY_KEY_REUSED,
+    RESOURCE_BUSY,
     StatusCode,
 )
 from hotel_commons.testing.stores import InMemoryIdempotencyStore  # noqa: E402
@@ -203,6 +206,36 @@ def test_unexpected_exception_releases_the_key_and_propagates(store):
     PayView.raise_error = None
     assert _call().status_code == 200
     assert PayView.runs == 2
+
+
+def test_retry_later_releases_the_key(store):
+    PayView.raise_error = RetryLater(RESOURCE_BUSY)
+    busy = _call()
+    assert (busy.status_code, busy.data["status"], busy["Retry-After"]) == (409, RESOURCE_BUSY.code, "1")
+
+    PayView.raise_error = None
+    retried = _call()
+
+    assert (retried.status_code, PayView.runs) == (200, 2)  # a busy 409 is never replayed
+    assert not retried.has_header("Idempotent-Replayed")
+
+
+def test_lock_timeout_releases_the_key_and_answers_409(store):
+    lock_timeout = OperationalError("canceling statement due to lock timeout")
+    lock_timeout.__cause__ = LockNotAvailable("canceling statement due to lock timeout")
+    PayView.raise_error = lock_timeout
+    busy = _call()
+    assert (busy.status_code, busy.data["status"], busy["Retry-After"]) == (409, RESOURCE_BUSY.code, "1")
+
+    PayView.raise_error = None
+    assert _call().status_code == 200
+    assert PayView.runs == 2
+
+
+def test_docstring_names_the_durable_keys_only_where_they_exist():
+    doc = decorators.__doc__
+    assert "the database's unique idempotency keys keep writes single" not in doc
+    assert "best-effort" in doc and "payment" in doc and "booking create" in doc
 
 
 def test_redis_error_still_runs_the_view(monkeypatch):

@@ -6,10 +6,12 @@ lives in the instance; the services are stateless and safe to share across threa
 
 from functools import lru_cache
 
+from django.conf import settings
 from hotel_commons.db.unit_of_work import DjangoUnitOfWork
 from hotel_commons.domain.clock import SystemClock
 
 from payment.adapters.mock_gateway import MockPaymentGateway
+from payment.domain.fingerprint import RequestFingerprinter
 from payment.domain.methods import CardHandler, PaymentMethodRegistry, UpiHandler, WalletHandler
 from payment.interfaces.gateway import PaymentGateway
 from payment.repositories.payment_repository import DjangoPaymentRepository
@@ -34,7 +36,13 @@ def payment_method_registry() -> PaymentMethodRegistry:
 
 @lru_cache(maxsize=1)
 def charge_service() -> ChargeService:
-    return ChargeService(DjangoPaymentRepository(), payment_method_registry(), payment_gateway(), DjangoUnitOfWork())
+    return ChargeService(
+        DjangoPaymentRepository(),
+        payment_method_registry(),
+        payment_gateway(),
+        DjangoUnitOfWork(),
+        RequestFingerprinter(settings.IDEMPOTENCY_FINGERPRINT_KEY),
+    )
 
 
 @lru_cache(maxsize=1)

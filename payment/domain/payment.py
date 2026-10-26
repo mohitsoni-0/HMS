@@ -2,9 +2,11 @@
 
 INITIATED -> SUCCEEDED | FAILED; SUCCEEDED -> PARTIALLY_REFUNDED | REFUNDED; PARTIALLY_REFUNDED ->
 PARTIALLY_REFUNDED | REFUNDED. Anything else is Conflict(INVALID_PAYMENT_TRANSITION). A payment is
-created before the gateway call, so its unique idempotency key stops a concurrent duplicate charge.
+created before the gateway call, so its unique idempotency key stops a concurrent duplicate charge. It also
+keeps the fingerprint of the charge request, so its key is replayed only for that same request.
 """
 
+import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final, Self
@@ -12,7 +14,7 @@ from uuid import UUID
 
 from hotel_commons.domain.money import Money
 from hotel_commons.exceptions import BusinessRuleViolation, Conflict, ValidationFailed
-from hotel_commons.status_code import VALIDATION_FAILED
+from hotel_commons.status_code import IDEMPOTENCY_KEY_REUSED, VALIDATION_FAILED
 from uuid6 import uuid7
 
 from payment.domain.instrument import PaymentInstrument
@@ -42,6 +44,7 @@ class Payment:
     gateway_txn_id: str | None = None
     failure_code: str | None = None
     failure_message: str | None = None
+    request_fingerprint: str | None = None  # None only on payments recorded before fingerprints existed
 
     @classmethod
     def initiate(
@@ -52,8 +55,10 @@ class Payment:
         amount: Money,
         instrument: PaymentInstrument,
         idempotency_key: str,
+        request_fingerprint: str,
     ) -> Self:
-        """A new INITIATED payment of a positive amount, identified for retries by ``idempotency_key``."""
+        """A new INITIATED payment of a positive amount, identified for retries by ``idempotency_key`` and
+        ``request_fingerprint`` (see ``RequestFingerprinter``)."""
         if not amount.is_positive():
             raise ValidationFailed(VALIDATION_FAILED, errors={"amount": "must be positive"})
         if not 0 < len(idempotency_key) <= IDEMPOTENCY_KEY_MAX_LENGTH:
@@ -69,7 +74,18 @@ class Payment:
             status=PaymentStatus.INITIATED,
             idempotency_key=idempotency_key,
             refunded_amount=Money.zero(amount.currency),
+            request_fingerprint=request_fingerprint,
         )
+
+    def ensure_same_request(self, request_fingerprint: str) -> None:
+        """BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED) when this payment's key was used for another request.
+
+        A payment recorded without a fingerprint is assumed to match, as before fingerprints existed.
+        """
+        if self.request_fingerprint is not None and not hmac.compare_digest(
+            self.request_fingerprint, request_fingerprint
+        ):
+            raise BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED)
 
     def mark_succeeded(self, gateway_txn_id: str) -> None:
         self._transition(PaymentStatus.SUCCEEDED)

@@ -20,6 +20,7 @@ class CreateBookingCommand:
     guests: int
     booking_type: BookingType
     contact: GuestContact = field(repr=False)
+    idempotency_key: str | None = None  # the client's Idempotency-Key, when sent
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from hotel_commons.domain.money import Money
+from hotel_commons.domain.validation import normalize_email
 from hotel_commons.exceptions import Conflict, NotFound
 
 from catalog.constants import AMENITY_SEED, DEFAULT_CHECK_IN_TIME, DEFAULT_CHECK_OUT_TIME
@@ -37,8 +38,8 @@ class InMemoryOwnerAccountRepository(OwnerAccountRepository):
         self.accounts: dict[UUID, OwnerAccount] = {}
 
     def add(self, account: OwnerAccount) -> None:
-        email = account.contact.email.strip().lower()
-        if any(stored.contact.email.strip().lower() == email for stored in self.accounts.values()):
+        email = normalize_email(account.contact.email)
+        if any(normalize_email(stored.contact.email) == email for stored in self.accounts.values()):
             raise Conflict(OWNER_ACCOUNT_EXISTS)
         account.created_at = CREATED_AT
         self.accounts[account.id] = copy.deepcopy(account)
@@ -58,7 +59,7 @@ class InMemoryPropertyRepository(PropertyRepository):
 
     def add_room_type(self, room_type: RoomType) -> None:
         stored = self.properties[room_type.property_id]
-        if any(existing.name.lower() == room_type.name.lower() for existing in stored.room_types):
+        if any(existing.name_key == room_type.name_key for existing in stored.room_types):
             raise Conflict(DUPLICATE_ROOM_TYPE_NAME, name=room_type.name)
         stored.room_types.append(copy.deepcopy(room_type))
 

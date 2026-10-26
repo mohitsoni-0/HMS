@@ -1,7 +1,8 @@
 """Last-resort error envelope (LLD §3.8 row 3).
 
 DRF views answer their own errors through ``envelope_exception_handler``; this middleware catches what
-escapes a view: an ``AppError`` from a plain Django view, or any unexpected exception, which is logged and
+escapes a view: an ``AppError`` from a plain Django view, a lock or statement timeout (409 RESOURCE_BUSY /
+503 SERVICE_TIMEOUT with Retry-After, logged as a warning), or any unexpected exception, which is logged and
 answered with a 500 INTERNAL_ERROR that reveals nothing. It answers with a ``JsonResponse``, never a DRF
 ``Response`` (there is no renderer outside DRF). Django's own client-error exceptions (Http404,
 PermissionDenied, BadRequest, SuspiciousOperation) are left to Django, which answers them through the
@@ -15,8 +16,9 @@ from typing import Final
 from django.core.exceptions import BadRequest, PermissionDenied, SuspiciousOperation
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 
+from hotel_commons.api.exception_handler import log_app_error, retry_after_headers
 from hotel_commons.api.response import error_body
-from hotel_commons.consts import RETRY_AFTER_HEADER
+from hotel_commons.db.errors import retryable_database_error
 from hotel_commons.exceptions import AppError
 from hotel_commons.status_code import INTERNAL_ERROR
 
@@ -35,6 +37,9 @@ class ExceptionHandlingMiddleware:
     def process_exception(self, request: HttpRequest, exception: Exception) -> JsonResponse | None:
         if isinstance(exception, AppError):
             return _app_error_response(exception)
+        retryable = retryable_database_error(exception)
+        if retryable is not None:
+            return _app_error_response(retryable)
         if isinstance(exception, DJANGO_CLIENT_ERRORS):
             return None
         logger.error("Unhandled exception on %s %s", request.method, request.path, exc_info=exception)
@@ -42,8 +47,6 @@ class ExceptionHandlingMiddleware:
 
 
 def _app_error_response(exc: AppError) -> JsonResponse:
-    if exc.http_status >= 500:
-        logger.error("Request failed with status code %s", exc.status_code.code, exc_info=exc)
-    retry_after = getattr(exc, "retry_after_seconds", None)
-    headers = {RETRY_AFTER_HEADER: str(retry_after)} if retry_after is not None else None
-    return JsonResponse(error_body(exc.status_code, exc.message, exc.errors), status=exc.http_status, headers=headers)
+    log_app_error(exc)
+    return JsonResponse(error_body(exc.status_code, exc.message, exc.errors), status=exc.http_status,
+                        headers=retry_after_headers(exc))

@@ -1,7 +1,8 @@
 """``PaymentPort`` over the payment public API (LLD §8.3): booking's requests -> payment commands, and
 ``PaymentDTO`` -> ``ChargeResult``."""
 
-from typing import Final
+from collections.abc import Mapping
+from typing import Any, Final
 
 from booking.interfaces.ports import ChargeRequest, ChargeResult, PaymentPort, RefundRequest, RefundResult
 from payment.public.api import get_payment_api
@@ -13,8 +14,12 @@ _CHARGED: Final = frozenset({PaymentStatus.SUCCEEDED, PaymentStatus.PARTIALLY_RE
 
 
 class PaymentAdapter(PaymentPort):
-    def find_charge(self, idempotency_key: str) -> ChargeResult | None:
-        payment = get_payment_api().find_by_idempotency_key(idempotency_key)
+    def find_charge(
+        self, idempotency_key: str, method: str, method_details: Mapping[str, Any]
+    ) -> ChargeResult | None:
+        payment = get_payment_api().find_by_idempotency_key(
+            idempotency_key, method=method, method_details=method_details
+        )
         return None if payment is None else _charge_result(payment)
 
     def charge(self, request: ChargeRequest) -> ChargeResult:

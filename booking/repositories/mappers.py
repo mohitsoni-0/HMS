@@ -51,11 +51,13 @@ def to_domain(row: BookingModel) -> Booking:
         confirmed_at=row.confirmed_at,
         cancelled_at=row.cancelled_at,
         expired_at=row.expired_at,
+        idempotency_key=row.idempotency_key,
     )
 
 
 def new_row(booking: Booking) -> BookingModel:
-    """An unsaved model for a new booking; ``creation_date`` is stamped by the database insert."""
+    """An unsaved model for a new booking; ``creation_date`` is stamped by the insert, and the repository
+    copies it back onto the booking."""
     row = BookingModel(
         id=booking.id,
         guest_id=booking.guest_id,
@@ -76,6 +78,7 @@ def new_row(booking: Booking) -> BookingModel:
         guest_name=booking.contact.name,
         guest_email=booking.contact.email,
         guest_phone=booking.contact.phone,
+        idempotency_key=booking.idempotency_key,
     )
     apply(booking, row)
     return row

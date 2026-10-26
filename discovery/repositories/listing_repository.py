@@ -7,6 +7,7 @@ without a log, so the bulk path loses no audit trail; rows that already exist ge
 
 from collections.abc import Mapping, Sequence
 from typing import Final
+from uuid import UUID
 
 from django.db.models import Q
 
@@ -62,10 +63,15 @@ class DjangoListingRepository(ListingRepository):
             update_fields=[*_PROJECTED_FIELDS, *update_stamps],
         )
 
-    def find(self, predicates: Sequence[Predicate], limit: int) -> list[Listing]:
+    def find(
+        self, predicates: Sequence[Predicate], limit: int, after: tuple[UUID, UUID] | None = None
+    ) -> list[Listing]:
         condition = Q()
         for predicate in predicates:
             condition &= _to_q(predicate)
+        if after is not None:
+            property_id, room_type_id = after
+            condition &= Q(property_id__gt=property_id) | Q(property_id=property_id, room_type_id__gt=room_type_id)
         rows = ListingRow.objects.filter(condition).order_by("property_id", "room_type_id")[:limit]
         return [_to_domain(row) for row in rows]
 

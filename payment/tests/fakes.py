@@ -1,4 +1,5 @@
-"""In-memory test doubles for the payment services: repositories, a counting gateway and a method registry.
+"""In-memory test doubles for the payment services: repositories, a counting gateway, a method registry and
+a request fingerprinter.
 
 The repositories store copies, so a service that forgets ``save`` is caught by the tests. Nothing here
 imports Django.
@@ -12,6 +13,7 @@ from hotel_commons.exceptions import NotFound
 
 from payment.adapters.mock_gateway import MockPaymentGateway
 from payment.domain.errors import DuplicatePayment
+from payment.domain.fingerprint import RequestFingerprinter
 from payment.domain.methods import CardHandler, PaymentMethodRegistry, UpiHandler, WalletHandler
 from payment.domain.payment import Payment
 from payment.domain.refund import Refund
@@ -95,3 +97,8 @@ def method_registry(clock: Clock) -> PaymentMethodRegistry:
     for handler in (CardHandler(clock), UpiHandler(), WalletHandler()):
         registry.register(handler)
     return registry
+
+
+def fingerprinter() -> RequestFingerprinter:
+    """A fingerprinter under a fixed test key."""
+    return RequestFingerprinter(b"payment-test-fingerprint-key-32b")

@@ -2,7 +2,9 @@
 
 The script fetches the server's public key from ``security/public-key``, encrypts the JSON body with a
 fresh AES-256 key wrapped by that key, sends the request with the v1 headers, and opens the response with
-the same AES key. Rejections by the encryption middleware come back in plaintext and are printed as is.
+the same AES key. The path and query string are both bound into the AAD. Without ``--data`` a GET sends no
+body and any other method a sealed ``{}``. Rejections by the encryption middleware come back in plaintext
+and are printed as is.
 
 Examples (server from ``docker compose up``)::
 
@@ -57,7 +59,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("method", help="HTTP method, e.g. GET or POST")
     parser.add_argument("path", help="URL path with optional query string, e.g. /hotel/v1/bookings")
-    parser.add_argument("--data", help="JSON request body (omit for an empty body)")
+    parser.add_argument("--data", help="JSON request body (omit: no body for GET, a sealed {} otherwise)")
     parser.add_argument("--token", help="bearer JWT, e.g. from `manage.py mint_token`")
     parser.add_argument("--header", action="append", default=[], help="extra header 'Name: value' (repeatable)")
     parser.add_argument("--base-url", default="http://localhost:8000")

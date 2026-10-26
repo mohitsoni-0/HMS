@@ -5,7 +5,7 @@ translation of the Django repository, so the service tests exercise the real fil
 """
 
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Final
 from uuid import UUID, uuid4
 
@@ -22,6 +22,8 @@ from hotel_commons.domain.money import Money
 CHECK_IN: Final = date(2026, 11, 16)  # Monday
 CHECK_OUT: Final = date(2026, 11, 18)
 STAY: Final = DateRange(CHECK_IN, CHECK_OUT)
+TODAY: Final = date(2026, 11, 1)  # the fake inventory's "today"
+WINDOW: Final = DateRange(TODAY, TODAY + timedelta(days=365))
 
 
 def _equals_ignoring_case(actual: Any, expected: Any) -> bool:
@@ -39,21 +41,30 @@ _OPERATORS: Final[Mapping[Op, Callable[[Any, Any], bool]]] = {
 
 
 class InMemoryListingRepository(ListingRepository):
-    """Listings keyed by room type; ``find`` applies every predicate (AND) and returns them in insertion order."""
+    """Listings keyed by room type; ``find`` applies every predicate (AND) and pages by
+    ``(property_id, room_type_id)`` like the Django repository."""
 
     def __init__(self, listings: Sequence[Listing] = ()) -> None:
         self.rows: dict[UUID, Listing] = {}
-        self.find_calls: list[tuple[tuple[Predicate, ...], int]] = []
+        self.find_calls: list[tuple[tuple[Predicate, ...], int, tuple[UUID, UUID] | None]] = []
         self.upsert_many(listings)
 
     def upsert_many(self, listings: Sequence[Listing]) -> None:
         for listing in listings:
             self.rows[listing.room_type_id] = listing
 
-    def find(self, predicates: Sequence[Predicate], limit: int) -> list[Listing]:
-        self.find_calls.append((tuple(predicates), limit))
-        matches = [listing for listing in self.rows.values() if _matches_all(listing, predicates)]
-        return matches[:limit]
+    def find(
+        self, predicates: Sequence[Predicate], limit: int, after: tuple[UUID, UUID] | None = None
+    ) -> list[Listing]:
+        self.find_calls.append((tuple(predicates), limit, after))
+        matches = sorted(
+            (listing for listing in self.rows.values() if _matches_all(listing, predicates)), key=_position
+        )
+        return [listing for listing in matches if after is None or _position(listing) > after][:limit]
+
+
+def _position(listing: Listing) -> tuple[UUID, UUID]:
+    return listing.property_id, listing.room_type_id
 
 
 def _matches_all(listing: Listing, predicates: Sequence[Predicate]) -> bool:
@@ -61,12 +72,25 @@ def _matches_all(listing: Listing, predicates: Sequence[Predicate]) -> bool:
 
 
 class FakeAvailabilityPort(AvailabilityPort):
-    """Every room type has ``default_rooms`` free unless ``rooms_by_type`` says otherwise; 0 means sold out."""
+    """Every room type has ``default_rooms`` free unless ``rooms_by_type`` says otherwise; 0 means sold out.
 
-    def __init__(self, rooms_by_type: Mapping[UUID, int] | None = None, *, default_rooms: int = 5) -> None:
+    The booking window defaults to ``WINDOW``, which contains ``STAY``.
+    """
+
+    def __init__(
+        self,
+        rooms_by_type: Mapping[UUID, int] | None = None,
+        *,
+        default_rooms: int = 5,
+        window: DateRange | None = None,
+    ) -> None:
         self.rooms_by_type = dict(rooms_by_type or {})
         self.default_rooms = default_rooms
+        self.window = window or WINDOW
         self.calls: list[tuple[tuple[UUID, ...], DateRange, int]] = []
+
+    def booking_window(self) -> DateRange:
+        return self.window
 
     def available_rooms(self, room_type_ids: Sequence[UUID], stay: DateRange, rooms: int) -> dict[UUID, int]:
         self.calls.append((tuple(room_type_ids), stay, rooms))

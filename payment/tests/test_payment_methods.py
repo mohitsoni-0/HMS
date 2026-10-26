@@ -6,6 +6,7 @@ Pure unit tests: no Django, no database.
 from datetime import UTC, datetime
 
 import pytest
+from hotel_commons.domain.validation import is_indian_mobile
 from hotel_commons.exceptions import ValidationFailed
 from hotel_commons.testing.clock import FixedClock
 
@@ -141,3 +142,18 @@ def test_registry_resolves_by_member_or_name_and_rejects_unknown() -> None:
 
     with pytest.raises(ValidationFailed):
         PaymentMethodRegistry().get(PaymentMethod.WALLET)
+
+
+def test_wallet_phone_follows_the_shared_indian_mobile_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    for phone in ("9876543210", "6000000001", "5876543210", "9876543210\n", " 9876543210", "98765 43210"):
+        accepted = True
+        try:
+            WalletHandler().parse({"provider": "PAYTM", "phone": phone})
+        except ValidationFailed:
+            accepted = False
+        assert accepted is is_indian_mobile(phone), phone
+
+    monkeypatch.setattr("payment.domain.methods.is_indian_mobile", lambda value: False)
+    with pytest.raises(ValidationFailed) as error:
+        WalletHandler().parse({"provider": "PAYTM", "phone": "9876543210"})
+    assert error.value.message == "Invalid phone"

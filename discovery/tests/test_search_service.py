@@ -4,6 +4,7 @@ Pure Python: in-memory listings and fake availability and quote ports, no Django
 """
 
 import logging
+from datetime import timedelta
 from typing import ClassVar
 from uuid import UUID
 
@@ -19,14 +20,18 @@ from discovery.services.search_service import SearchService
 from discovery.status_code import INVALID_SEARCH
 from discovery.tests.fakes import (
     STAY,
+    TODAY,
+    WINDOW,
     FakeAvailabilityPort,
     FakeQuotePort,
     InMemoryListingRepository,
     make_criteria,
     make_listing,
 )
+from hotel_commons.domain.date_range import DateRange
 from hotel_commons.domain.money import Money
 from hotel_commons.exceptions import ValidationFailed
+from hotel_commons.status_code import VALIDATION_FAILED
 
 
 def _rupees(amount: int) -> Money:
@@ -241,18 +246,80 @@ def test_registering_a_second_filter_under_a_taken_name_fails() -> None:
         registry.register(Impostor)
 
 
-def test_candidate_cap_is_passed_to_the_repository_and_logged(caplog: pytest.LogCaptureFixture) -> None:
-    repository = InMemoryListingRepository([make_listing(), make_listing(), make_listing()])
-    service = SearchService(
-        listings=repository, availability=FakeAvailabilityPort(), quotes=FakeQuotePort(), max_candidates=2
-    )
+def test_every_candidate_is_read_in_batches_so_nothing_is_dropped() -> None:
+    sold_out = [make_listing(property_name=f"Sold out {n}") for n in range(5)]
+    bookable = make_listing(property_name="Bookable")
+    repository = InMemoryListingRepository([*sold_out, bookable])
+    availability = FakeAvailabilityPort({listing.room_type_id: 0 for listing in sold_out})
+    service = SearchService(listings=repository, availability=availability, quotes=FakeQuotePort(), batch_size=2)
+
+    page = service.search(make_criteria())
+
+    assert _property_names(page) == ["Bookable"]
+    assert page.total == 1
+    assert [len(call[0]) for call in availability.calls] == [2, 2, 2]
+    assert [call[1:] for call in repository.find_calls] == [
+        (2, None),
+        (2, _position(repository, 2)),
+        (2, _position(repository, 4)),
+        (2, _position(repository, 6)),
+    ]
+
+
+def test_price_sort_and_total_cover_every_batch() -> None:
+    prices = [9000, 3000, 7000, 1000, 5000]
+    listings = [make_listing(property_name=f"P{rupees}", base_price=_rupees(rupees)) for rupees in prices]
+    service = _service(*listings, batch_size=2)
+
+    page = service.search(make_criteria(page_size=2))
+
+    assert _property_names(page) == ["P1000", "P3000"]
+    assert page.total == 5
+
+
+def test_a_very_large_search_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    service = _service(make_listing(), make_listing(), make_listing(), batch_size=2, large_search_candidates=2)
 
     with caplog.at_level(logging.WARNING, logger="discovery.services.search_service"):
         page = service.search(make_criteria())
 
-    assert repository.find_calls[0][1] == 2
-    assert page.total == 2
-    assert "cap" in caplog.text
+    assert page.total == 3
+    assert "3 candidate listings" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("stay", "field"),
+    [
+        (DateRange(TODAY - timedelta(days=1), TODAY + timedelta(days=1)), "check_in"),
+        (DateRange(WINDOW.end - timedelta(days=1), WINDOW.end + timedelta(days=1)), "check_out"),
+    ],
+)
+def test_a_stay_outside_the_booking_window_is_refused(stay: DateRange, field: str) -> None:
+    repository = InMemoryListingRepository([make_listing()])
+    service = SearchService(listings=repository, availability=FakeAvailabilityPort(), quotes=FakeQuotePort())
+
+    with pytest.raises(ValidationFailed) as raised:
+        service.search(make_criteria(stay=stay))
+
+    assert raised.value.status_code is VALIDATION_FAILED
+    assert set(raised.value.errors) == {field}
+    assert repository.find_calls == []
+
+
+def test_the_first_and_last_bookable_stays_are_searched() -> None:
+    service = _service(make_listing())
+    first = DateRange(TODAY, TODAY + timedelta(days=1))
+    last = DateRange(WINDOW.end - timedelta(days=1), WINDOW.end)
+
+    assert service.search(make_criteria(stay=first)).total == 1
+    assert service.search(make_criteria(stay=last)).total == 1
+
+
+def _position(repository: InMemoryListingRepository, index: int) -> tuple[UUID, UUID]:
+    """The keyset position of the ``index``-th listing (1-based) in the repository's order."""
+    ordered = sorted(repository.rows.values(), key=lambda listing: (listing.property_id, listing.room_type_id))
+    listing = ordered[index - 1]
+    return listing.property_id, listing.room_type_id
 
 
 @pytest.mark.parametrize(

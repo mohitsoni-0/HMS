@@ -21,10 +21,11 @@ ROOM_TYPE_NAME_CONSTRAINT = "catalog_room_type_property_name_uniq"
 
 class DjangoPropertyRepository(PropertyRepository):
     def add(self, property_: PropertyEntity) -> None:
+        """The property, then each room type in its own savepoint, so a name the database finds taken is a 409."""
         with transaction.atomic():
             property_to_model(property_).save(force_insert=True)
             for room_type in property_.room_types:
-                room_type_to_model(room_type).save(force_insert=True)
+                self.add_room_type(room_type)
 
     def add_room_type(self, room_type: RoomTypeEntity) -> None:
         try:

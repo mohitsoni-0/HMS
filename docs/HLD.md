@@ -97,15 +97,15 @@ flowchart LR
 | App | Responsibility | Owns (tables) | Public API (`<app>.public`) | Depends on |
 |---|---|---|---|---|
 | `catalog` | Owner accounts, properties, room types, amenities, commercial settings (pricing strategy, cancellation policy) | owner_account, property, room_type (+ logs), amenity | `CatalogAPI`, events `PropertyOnboarded`, `RoomTypeAdded`, published enums | inventory |
-| `inventory` | Per-night allotment per room type; holds | allotment, room_night, hold (+ log) | `InventoryAPI`: provision, extend_horizon, hold, confirm, release, availability, occupancy | — |
+| `inventory` | Per-night allotment per room type; holds | allotment, room_night, hold (+ log) | `InventoryAPI`: provision, extend_horizon, hold, confirm, release, availability, occupancy, occupancy_many (one query for many room types), booking_window | — |
 | `pricing` | Nightly prices through pluggable strategies | — | `PricingAPI`: quote, quote_many | inventory, catalog (enums) |
 | `discovery` | Search read model and filter pipeline | listing | — (HTTP only) | catalog (events), inventory, pricing |
 | `booking` | Booking aggregate, lifecycle, booking types, cancellation policies; orchestrates pay and cancel | booking (+ log) | events only (no other app calls booking) | catalog, pricing, inventory, payment |
-| `payment` | Payments, refunds, method strategies, gateway | payment, refund (+ logs) | `PaymentAPI`: find_by_idempotency_key, charge, refund, get_payment | — |
+| `payment` | Payments, refunds, method strategies, gateway | payment, refund (+ logs) | `PaymentAPI`: find_by_idempotency_key (checks the request fingerprint), charge, refund, get_payment; `PaymentMethodRequestSerializer`, the pay-request body other contexts accept | — |
 
 ### 3.4 Context map
 
-Arrows point from the importing app to the `public` package it uses. The graph is acyclic, and an architecture test fails the build on a cycle or on any cross-app import that bypasses `public`.
+Arrows point from the importing app to the `public` package it uses. The graph is acyclic, and an architecture test (`tests/architecture/test_module_boundaries.py`, an AST walk over every import, function-level ones included) fails the build on a cycle, on an app dependency missing from this map, on any cross-app import that bypasses `public`, on a `services/` package importing another app, and on Django or DRF in any `domain/` or `interfaces/` package.
 
 ```mermaid
 flowchart TD
@@ -152,15 +152,16 @@ An installable package in `libs/hotel-commons` (`pip install -e`), playing the s
 
 | Module | Provides |
 |---|---|
-| `settings.base_settings` | DRF config, middleware order, logging, Postgres and Redis from env |
+| `settings.base_settings` | DRF config, middleware order, logging, Postgres (request-path lock and statement timeouts from `DB_LOCK_TIMEOUT_MS` / `DB_STATEMENT_TIMEOUT_MS`) and Redis from env |
+| `db` | `DjangoUnitOfWork`, `schema_table()`, the schema-aware PostgreSQL backend (introspection and FK removal understand `schema_table()` names), lock and statement timeouts mapped to retryable errors |
 | `models` | `AddCommonField`, the log-model strategy (`CustomUpdateManager.set_logModel`, `add_log_model`), `EnumField`, `EncryptedTextField`, `BlindIndexField` |
 | `security` | `Principal` and roles, JWT `TokenService`, PII cipher / blind index / masking, IDOR guard, field-level security, API payload cipher, permissions |
 | `middlewares` | request context, JWT authentication, API payload encryption, last-resort exception handling |
 | `ratelimit` | `RateLimiter` interface, Redis sliding-window implementation (atomic Lua), DRF throttle |
 | `idempotency` | `IdempotencyStore` interface, Redis store, `@idempotent` view decorator |
 | `events` | `DomainEvent`, `EventPublisher` interface, in-process bus |
-| `domain` | `Money`, `DateRange`, `Clock`, `UnitOfWork` |
-| `api` | response envelope, DRF exception handler, `BaseViewSet`, pagination |
+| `domain` | `Money`, `DateRange`, `Clock`, `UnitOfWork`, shared contact rules (`validation`: Indian mobile numbers, email normalisation) |
+| `api` | response envelope, DRF exception handler, `BaseViewSet` (OPTIONS answers 405: the contract is the OpenAPI schema), pagination, OpenAPI envelopes (`envelope`, `envelope_list`) |
 | `exceptions`, `status_code`, `enum`, `context` | error hierarchy, status-code catalogue, labelled enums, request-scoped context (`ContextVar`) |
 | `testing` | fakes (clock, unit of work, event recorder, in-memory stores), token factory |
 
@@ -227,6 +228,8 @@ sequenceDiagram
     V-->>G: 200 page of properties with available room offers
 ```
 
+The stay must lie inside inventory's booking window (`[today, today + 365 days]`, 1–30 nights) and amenity codes must exist, else 400: search never lists what cannot be booked. `quote_many` reads occupancy once for every DYNAMIC-priced room type (`InventoryAPI.occupancy_many`), so a search costs one availability query and at most one occupancy query, whatever the number of candidates. A result's `amenities` is the property's own amenities plus those of its room types.
+
 ### 6.3 Create a booking (hold)
 
 ```mermaid
@@ -263,7 +266,7 @@ sequenceDiagram
     V->>V: @idempotent: replay, 409 in progress, or 422 key reuse
     V->>S: execute(command)
     S->>R: get_for_update(booking) row lock
-    S->>Pay: find_charge(pay:booking:key) durable replay, works even if Redis lost the key
+    S->>Pay: find_charge(pay:booking:key, method, details) durable replay, works even if Redis lost the key, 422 if the body differs
     alt hold expired
         S->>S: booking.expire()
         S->>I: release_hold()
@@ -311,7 +314,7 @@ A `scheduler` container in docker compose runs two commands every 60 seconds:
 - `manage.py expire_pending_bookings` reads the ids of `PENDING_PAYMENT` bookings whose `hold_expires_at <= now`. It then handles each booking in **its own transaction**: lock it with `FOR UPDATE SKIP LOCKED`, expire it, release its hold.
 - `manage.py extend_inventory_horizon` keeps per-night rows provisioned up to today + 365 days.
 
-The pay flow also expires lazily (§6.4), so correctness never depends on the job's timing. In production the same commands run from cron or Celery beat.
+Each run of the expiry job works through batches until one comes back short or its time budget is spent, and never retries in the same run a booking that just failed. The pay flow also expires lazily (§6.4), so booking and payment state never depend on the job's timing: a payment after `hold_expires_at` never charges. Availability does: inventory counts a lapsed hold's rooms as reserved until the job releases them, so they are back on sale within one scheduler interval (about 60 s) of the expiry (trade-off, §15). In production the same commands run from cron or Celery beat.
 
 ## 7. Lifecycles
 
@@ -415,7 +418,7 @@ classDiagram
 - A random 96-bit nonce per value; the key id in the prefix allows key rotation.
 - The ciphertext is bound to its column with associated data (`<PI type>|<column>`), so it can't be copied into another column. Only the cipher's own `Ciphertext` type skips re-encryption, so user input that looks like ciphertext is still encrypted.
 - Equality lookups use a keyed HMAC-SHA256 blind index (`<field>_hash`). The unique index on the owner's contact-email hash blocks duplicate accounts without querying plaintext. Direct lookups on encrypted columns raise an error.
-- `masked_<field>` columns serve list screens and owner views without decrypting.
+- `masked_<field>` columns are written on every save for reads that must not decrypt (SQL, support and BI tooling). The API decrypts and masks in the serializer for anyone but the subject and ADMIN.
 - Commands and DTOs that carry PII or card data hide those fields from `repr`; services log ids only; a logging filter redacts emails, phone numbers and card numbers as a safety net.
 - Keys come from env (`PII_ENCRYPTION_KEYS`, `PII_BLIND_INDEX_KEY`), and settings refuse to start with missing or short keys. In production a KMS would supply data keys (envelope encryption).
 
@@ -425,11 +428,11 @@ classDiagram
 |---|---|---|
 | Rate limiting | `hb:rl:v1:{scope}:{subject}` | sorted set of request timestamps; TTL = window |
 | Idempotency | `hb:idem:v1:{scope}:{principal}:{key}` | encrypted record (state, HMAC fingerprint, response); 60 s in progress, 24 h completed |
-| Encrypted-payload replay guard | `hb:enc:v1:{sha256(wrapped key)}` | flag; 5 min |
+| Encrypted-payload replay guard | `hb:enc:v1:{sha256(wrapped key)}` | flag; 2 × clock skew + margin (11 min), so it outlives the whole ±5 min timestamp window |
 
 Redis is never the source of truth:
 - If it is down, rate limiting fails open, except for payments, which fail closed.
-- Idempotency falls back to Postgres: the payment table's unique key plus a durable replay check in the pay flow, so a payment still cannot be charged twice.
+- Idempotency falls back to Postgres where the key is stored with the write: the payment table's unique key plus a durable replay check in the pay flow (which compares the stored request fingerprint, so a reused key is still 422), so a payment still cannot be charged twice; and booking create's unique `(guest_id, idempotency_key)`, so a retried create returns the first booking. Cancel and catalog writes are best effort while Redis is down.
 - IDOR ownership is always read from Postgres (no cache), so it can never be stale.
 
 ### 8.6 Scaling the data tier
@@ -451,13 +454,15 @@ Redis is never the source of truth:
 3. **Global lock order.** Night rows are always locked ordered by `(room_type_id, stay_date)`, and a transaction never locks the nights of more than one hold. The expiry job therefore handles one booking per transaction, with `FOR UPDATE SKIP LOCKED`, so workers never block each other and never deadlock against new bookings.
 4. **Payment idempotency** is layered:
    - Redis `SET NX` rejects duplicates fast.
-   - A durable replay check in the pay flow finds an earlier charge by its key before the status check, so a retried success still returns 200 after Redis forgets the key.
+   - A durable replay check in the pay flow finds an earlier charge by its key before the status check, so a retried success still returns 200 after Redis forgets the key. The payment row stores an HMAC-SHA256 fingerprint of the method and its details (`IDEMPOTENCY_FINGERPRINT_KEY` over canonical JSON, never raw card data), and a durable replay with a different fingerprint is 422 `IDEMPOTENCY_KEY_REUSED`, as in Redis.
    - A unique `idempotency_key` on payment and refund is the final guarantee. The payment row is inserted before the gateway call, so a concurrent duplicate fails on the insert.
    - The gateway receives the same key.
-5. **No missing inventory rows.** A hold first inserts any missing night rows (`ON CONFLICT DO NOTHING`), and a daily job extends the horizon, so a free room is never refused because a row wasn't provisioned yet.
-6. **Same-transaction events.** The in-process bus runs handlers inside the writer's transaction, so a catalog row, its inventory rows and its discovery listing commit together.
-7. **Outcomes that must persist.** A declined payment or an expired hold is committed first; the service returns an outcome and the view answers 402 or 409. Nothing is rolled back by raising after the state change.
-8. **Proof.** An integration test races 10 threads for the last room against real Postgres and asserts exactly one booking succeeds. A second test races overlapping stays in both orders to show there is no deadlock.
+5. **Booking create idempotency is durable.** A create with an `Idempotency-Key` stores it on the booking under a unique `(guest_id, idempotency_key)`; a retry returns the first booking even without Redis, and a concurrent retry that loses the insert race rolls its own hold back.
+6. **Fail fast, retryably.** Request and job connections run with `lock_timeout=2s` and `statement_timeout=5s`. A lock wait that times out (SQLSTATE 55P03) answers 409 `RESOURCE_BUSY`, a cancelled statement (57014) answers 503 `SERVICE_TIMEOUT`, both with `Retry-After: 1` and logged as warnings; the transaction rolls back, so a retry is safe. `migrate` runs with both timeouts off, so a long schema change is not cancelled at deploy.
+7. **No missing inventory rows.** A hold first inserts any missing night rows (`ON CONFLICT DO NOTHING`), and a daily job extends the horizon, so a free room is never refused because a row wasn't provisioned yet.
+8. **Same-transaction events.** The in-process bus runs handlers inside the writer's transaction, so a catalog row, its inventory rows and its discovery listing commit together.
+9. **Outcomes that must persist.** A declined payment or an expired hold is committed first; the service returns an outcome and the view answers 402 or 409. Nothing is rolled back by raising after the state change.
+10. **Proof.** Integration tests run real threads against Postgres. Inventory: 10 threads race for the last room (one winner); stays sharing three nights race in both assignments over many rounds, and a hold races an overlapping release, with no deadlock or lock timeout; the lock SQL is pinned to `ORDER BY stay_date FOR UPDATE`, and a negative control proves an opposite lock order is caught. Booking: pay racing the expiry job (one outcome, one charge at most), a double cancel (one refund), two pays with different keys (one charge) and 10 guests booking the last room over HTTP (one 201).
 
 Alternatives considered:
 - **Per-physical-room bookings with an exclusion constraint** (`EXCLUDE USING gist (room_id WITH =, stay WITH &&)`, or PostgreSQL 18 `WITHOUT OVERLAPS`). Rejected: guests book room types, not room numbers (A1).
@@ -472,7 +477,7 @@ Alternatives considered:
 | Roles | **GUEST:** search, book, pay, cancel own bookings. **OWNER:** create accounts, onboard and manage own properties, list and view bookings of own properties with guest PII masked. **ADMIN:** everything. |
 | IDOR | Views declare `idor_rules` per action: resource, where the id is (path, body or query), and which **relationship** counts (`guest`, `owner`). Access needs the matching role *and* relationship. A user who is both guest and owner can view a stranger's booking at their own property but cannot pay for or cancel it. Ownership is resolved from Postgres through resolvers each app registers. A failed check answers **404**, so existence isn't confirmed. List endpoints are always scoped to the caller. |
 | Field-level security | Serializers declare `field_policies`. Write-restricted fields return 403 (e.g. `on_behalf_of_user_id` is ADMIN-only). Read-restricted fields are masked or dropped: guest PII is visible only to the guest themself and ADMIN, and masked for everyone else; `gateway_txn_id` is ADMIN-only. |
-| API payload encryption | Hybrid RSA-OAEP-256 (3072-bit) + AES-256-GCM. The client encrypts the body with a fresh AES key and sends that key wrapped by the server's RSA public key (`X-Encrypted-Key`) with a timestamp. Associated data binds method, path, timestamp and direction. Every encryption uses a fresh nonce. A wrapped key is accepted once (Redis replay guard). The response is encrypted with the same AES key. Modes: `off`, `optional` (local default), `enforced`, with an exact-path bypass list (health, docs, schema, public key, dev tokens). |
+| API payload encryption | Hybrid RSA-OAEP-256 (3072-bit) + AES-256-GCM. The client encrypts the body with a fresh AES key and sends that key wrapped by the server's RSA public key (`X-Encrypted-Key`) with a timestamp. Associated data binds direction, method, path with its query string, and timestamp, and every method but GET/HEAD/OPTIONS must carry a sealed body. Every encryption uses a fresh nonce. A wrapped key is accepted once (Redis replay guard, kept for the whole timestamp window). The response is encrypted with the same AES key. Modes: `off`, `optional` (local default), `enforced`, with an exact-path bypass list (health, docs, schema, public key, dev tokens). |
 | Rate limiting | Sliding-window log in Redis, run as one atomic Lua script using Redis server time. Per-scope policies (default 120/min, search 60/min, booking writes 20/min, payments 10/min) keyed by principal, or by client IP when anonymous. The client IP comes from `REMOTE_ADDR`, or from a configured number of trusted proxy hops, so spoofed `X-Forwarded-For` values can't mint fresh buckets. Returns `429` with `Retry-After` and `X-RateLimit-*` headers. Fails open if Redis is down, except payments, which fail closed. Encrypted requests are also IP-limited before any RSA work. |
 | PII at rest | §8.4 |
 | Audit | Log-model rows record who changed what, when, and in which request. |
@@ -500,12 +505,15 @@ Alternatives considered:
   - Amounts travel as rupee strings (`"9600.00"`) with a sibling `currency`, and are stored as integer paisa.
   - Enums travel as names (`"PREPAID"`) and are stored as SMALLINT.
 - Status codes follow `SS MM EEE`: service `21`, module (`00` common, `01` catalog, `02` inventory, `03` pricing, `04` discovery, `05` booking, `06` payment), error number. Each app keeps its catalogue in `status_code.py`, as in the reference services.
-- HTTP mapping: 400 validation · 401 token · 402 payment declined · 403 role or field · 404 not found or not yours · 409 state conflict, no inventory, idempotent request in progress · 422 business rule or idempotency-key reuse · 429 rate limit · 500 unexpected.
+- HTTP mapping: 400 validation (search included: a stay outside the booking window, a bad date order or length, an unknown amenity code) · 401 token · 402 payment declined · 403 role or field · 404 not found or not yours · 405 method not allowed (OPTIONS included) · 409 state conflict, no inventory, idempotent request in progress, resource busy (lock timeout, `Retry-After`) · 422 business rule or idempotency-key reuse · 429 rate limit · 500 unexpected · 503 statement timeout (`Retry-After`) or health check failing.
+- The OpenAPI document is generated by drf-spectacular and checked by a contract test: it validates with no generator warnings, write operations declare `Idempotency-Key`, and real responses of a full booking journey (errors included) validate against their documented schemas.
 
 ## 13. Deployment and configuration
 
-- `docker compose up --build` starts `postgres:18`, `redis:7`, the app (gunicorn) and the scheduler (§6.6). Migrations and demo data (a chain owner with two properties and a standalone owner with one) run on start, so search works immediately.
-- Configuration is all environment variables. `.env.example` holds clearly labelled dev-only keys so compose works out of the box; settings refuse those keys unless `ENVIRONMENT=local`. `scripts/bootstrap_env.py` generates fresh local keys.
+- `docker compose up --build` starts `postgres:18`, `redis:7`, the app (gunicorn) and the scheduler (§6.6). Migrations (with the request-path DB timeouts off) and demo data (a chain owner with two properties and a standalone owner with one) run on start, so search works immediately.
+- Every published port is bound to `127.0.0.1`; the API's host port is `APP_PORT` (default 8000).
+- gunicorn's access log records the path without the query string (it bypasses the PII redaction filter, and query parameters such as `guest_id` may carry an email), plus status, size, duration and request id.
+- Configuration is all environment variables. `.env.example` holds clearly labelled dev-only keys so compose works out of the box; settings refuse those keys unless `ENVIRONMENT=local`. `scripts/bootstrap_env.py` writes a fresh local `.env` with random keys and a new RSA-3072 key under `secrets/local/` (mounted read-only), and refuses to overwrite either without `--force`.
 - `GET /hotel/v1/health` checks Postgres and Redis.
 
 ## 14. Path to microservices
@@ -518,7 +526,8 @@ Alternatives considered:
 
 ## 15. Trade-offs and future work
 
-- **Gateway call inside the booking transaction.** Simple and atomic with a mock. With a real gateway: create a pending payment, commit, call out, and confirm through a webhook or outbox to keep database transactions short.
+- **Gateway call inside the booking transaction.** The charge (pay) and the refund (cancel) run inside the booking's unit of work, under its row lock and, on cancel, the stay's night locks. Simple and atomic with the in-process mock: a failed refund rolls the whole cancel back. With a real gateway the locks are held for the network round trip, and a rollback after a successful call leaves no local trace of the money moved. Then: commit an INITIATED payment or refund in its own short transaction, call out without locks, settle through a webhook or outbox, and reconcile INITIATED rows.
+- **Expired holds return to sale on the next scheduler run.** Inventory does not reclaim a lapsed hold itself, so its rooms stay reserved for up to one scheduler interval (about 60 s) after `hold_expires_at`; booking and payment state are unaffected (§6.6). Releasing lapsed holds inside `hold()` would close the gap.
 - **Search computes availability and price per request.** Fine at this scale. At scale: precomputed availability, cached quotes, a search engine.
 - **Synchronous in-process events** trade decoupling for atomicity inside the monolith.
 - **Future work:** per-channel rate plans and inventory, partial cancellation, notifications, an outbox, OpenTelemetry tracing (as in the reference service), admin tooling.

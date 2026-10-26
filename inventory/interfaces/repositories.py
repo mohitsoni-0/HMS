@@ -50,8 +50,8 @@ class RoomNightRepository(ABC):
         """Room type -> fewest rooms free on any night of ``stay``, for room types with a row for every night."""
 
     @abstractmethod
-    def occupancy(self, room_type_id: UUID, dates: Sequence[date]) -> dict[date, Decimal]:
-        """Night -> share of rooms reserved (0..1), for the requested nights that have a row."""
+    def occupancy_many(self, room_type_ids: Sequence[UUID], dates: Sequence[date]) -> dict[UUID, dict[date, Decimal]]:
+        """Room type -> night -> share of rooms reserved (0..1), only for the requested nights that have a row."""
 
 
 class HoldRepository(ABC):

@@ -6,15 +6,16 @@ does. Stores hand out copies, so an entity changed but never saved is not persis
 """
 
 import copy
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from hotel_commons.domain.date_range import DateRange
-from hotel_commons.exceptions import Conflict, NotFound, UpstreamFailure
-from hotel_commons.status_code import RESOURCE_NOT_FOUND, StatusCode
+from hotel_commons.exceptions import BusinessRuleViolation, Conflict, NotFound, UpstreamFailure
+from hotel_commons.status_code import IDEMPOTENCY_KEY_REUSED, RESOURCE_NOT_FOUND, StatusCode
 
 from booking.domain.booking import Booking
 from booking.domain.value_objects import BookingPrice, RoomTypeInfo
@@ -29,7 +30,7 @@ from booking.interfaces.ports import (
     RefundRequest,
     RefundResult,
 )
-from booking.interfaces.repositories import BookingRepository
+from booking.interfaces.repositories import BookingRepository, DuplicateIdempotencyKey
 from booking.status_code import BOOKING_NOT_FOUND
 
 # Stand-ins for the other contexts' codes: booking tests never import another app's internals.
@@ -81,7 +82,8 @@ class SnapshotUnitOfWork:
 
 
 class InMemoryBookingRepository(BookingRepository):
-    """Bookings in a dict. ``locked_elsewhere`` simulates rows another worker holds (SKIP LOCKED)."""
+    """Bookings in a dict. ``locked_elsewhere`` simulates rows another worker holds (SKIP LOCKED); the
+    (guest, idempotency key) pair is unique as in Postgres."""
 
     def __init__(self) -> None:
         self._rows: dict[UUID, Booking] = {}
@@ -96,7 +98,17 @@ class InMemoryBookingRepository(BookingRepository):
     def add(self, booking: Booking) -> None:
         if booking.id in self._rows:
             raise AssertionError(f"booking {booking.id} added twice")
+        if booking.idempotency_key is not None and self.find_by_idempotency_key(
+            booking.guest_id, booking.idempotency_key
+        ):
+            raise DuplicateIdempotencyKey(booking.id)
         self._rows[booking.id] = copy.deepcopy(booking)
+
+    def find_by_idempotency_key(self, guest_id: str, idempotency_key: str) -> Booking | None:
+        for booking in self._rows.values():
+            if (booking.guest_id, booking.idempotency_key) == (guest_id, idempotency_key):
+                return copy.deepcopy(booking)
+        return None
 
     def get(self, booking_id: UUID) -> Booking:
         if booking_id not in self._rows:
@@ -123,9 +135,12 @@ class InMemoryBookingRepository(BookingRepository):
     def list_for_property(self, property_id: UUID, *, page: int, page_size: int) -> tuple[list[Booking], int]:
         return self._page([b for b in self._rows.values() if b.property_id == property_id], page, page_size)
 
-    def find_expired_pending_ids(self, now: datetime, limit: int) -> list[UUID]:
+    def find_expired_pending_ids(
+        self, now: datetime, limit: int, *, exclude: Collection[UUID] = frozenset()
+    ) -> list[UUID]:
         expired = sorted(
-            (b for b in self._rows.values() if _is_expired_pending(b, now)), key=lambda b: b.hold_expires_at
+            (b for b in self._rows.values() if _is_expired_pending(b, now) and b.id not in exclude),
+            key=lambda b: (b.hold_expires_at, b.id),
         )
         return [booking.id for booking in expired[:limit]]
 
@@ -215,28 +230,36 @@ class FakeInventory(InventoryPort):
 
 @dataclass
 class FakePayments(PaymentPort):
-    """Idempotent by key like the payment context. A card ending 0002 is declined; ``fail_refunds`` makes the
-    gateway reject refunds. The request logs survive a rollback (they record calls); the rows do not."""
+    """Idempotent by key like the payment context, which also refuses a key replayed for another method or
+    details (IDEMPOTENCY_KEY_REUSED). A card ending 0002 is declined; ``fail_refunds`` makes the gateway
+    reject refunds. The request logs survive a rollback (they record calls); the rows do not."""
 
     charges: dict[str, ChargeResult] = field(default_factory=dict)
+    charged_with: dict[str, tuple[str, dict[str, Any]]] = field(default_factory=dict)
     refunds: dict[str, RefundResult] = field(default_factory=dict)
     charge_requests: list[ChargeRequest] = field(default_factory=list)
     refund_requests: list[RefundRequest] = field(default_factory=list)
     fail_refunds: bool = False
 
     def snapshot(self) -> object:
-        return copy.deepcopy((self.charges, self.refunds))
+        return copy.deepcopy((self.charges, self.charged_with, self.refunds))
 
     def restore(self, state: object) -> None:
-        self.charges, self.refunds = copy.deepcopy(state)
+        self.charges, self.charged_with, self.refunds = copy.deepcopy(state)
 
-    def find_charge(self, idempotency_key: str) -> ChargeResult | None:
-        return self.charges.get(idempotency_key)
+    def find_charge(
+        self, idempotency_key: str, method: str, method_details: Mapping[str, Any]
+    ) -> ChargeResult | None:
+        prior = self.charges.get(idempotency_key)
+        if prior is not None and self.charged_with[idempotency_key] != (method, dict(method_details)):
+            raise BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED)
+        return prior
 
     def charge(self, request: ChargeRequest) -> ChargeResult:
         self.charge_requests.append(request)
         if request.idempotency_key not in self.charges:
             self.charges[request.idempotency_key] = _gateway_result(request)
+            self.charged_with[request.idempotency_key] = (request.method, dict(request.method_details))
         return self.charges[request.idempotency_key]
 
     def refund(self, request: RefundRequest) -> RefundResult:

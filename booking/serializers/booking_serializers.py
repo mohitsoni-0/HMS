@@ -3,8 +3,10 @@
 Amounts are rupee strings on the wire and integer paisa inside (``HotelAmountField``), with a sibling
 ``currency``; enums are member names (``HotelEnumField``). The guest's contact details are readable by the
 guest and by admins; everyone else (the property's owner) sees them masked. Response serializers render the
-domain ``Booking`` and the pay outcome directly; request serializers only validate shape, the domain
-enforces the business rules.
+domain ``Booking`` and the pay outcome directly, and mark every field that can be null as nullable so the
+published schema matches what is sent; request serializers only validate shape, the domain enforces the
+business rules. The pay body is the payment context's published ``PaymentMethodRequestSerializer``: booking
+holds no per-method knowledge, so a new payment method needs no change here.
 """
 
 from datetime import date
@@ -41,13 +43,12 @@ from booking.constants import (
 )
 from booking.enums import BookingRefundStatus, BookingStatus, BookingType
 from catalog.public.enums import CancellationPolicyCode, PricingStrategyCode
-from payment.public.enums import PaymentMethod, WalletProvider
+from payment.public.serializers import PaymentMethodRequestSerializer
 
 NightlyRate = tuple[date, Money]
 
 _USER_ID: Final = RegexValidator(r"^[A-Za-z0-9_.@-]{1,64}$", "Enter a valid user id.")
 _DEFAULT_PAGE_SIZE: Final = 20
-_DETAILS_FIELD: Final = {PaymentMethod.CARD: "card", PaymentMethod.UPI: "upi", PaymentMethod.WALLET: "wallet"}
 
 
 # --- Requests ----------------------------------------------------------------------------------------------
@@ -92,42 +93,9 @@ class BookingListQuerySerializer(BaseHotelSerializer):
     page_size = HotelIntegerField(min_value=1, max_value=MAX_PAGE_SIZE, default=_DEFAULT_PAGE_SIZE)
 
 
-class CardPaymentDetailsSerializer(BaseHotelSerializer):
-    card_number = HotelCharField(write_only=True, min_length=12, max_length=19)
-    expiry_month = HotelIntegerField(min_value=1, max_value=12)
-    expiry_year = HotelIntegerField(min_value=2000, max_value=2100)
-    cvv = HotelCharField(write_only=True, min_length=3, max_length=4)
-    holder_name = HotelCharField(min_length=2, max_length=100)
-
-
-class UpiPaymentDetailsSerializer(BaseHotelSerializer):
-    vpa = HotelCharField(max_length=321)
-
-
-class WalletPaymentDetailsSerializer(BaseHotelSerializer):
-    provider = HotelEnumField(WalletProvider)
-    phone = HotelPhoneField()
-
-
-class BookingPaymentSerializer(BaseHotelSerializer):
-    """The method and exactly one matching details object; the payment context validates the details."""
-
-    method = HotelEnumField(PaymentMethod)
-    card = CardPaymentDetailsSerializer(required=False)
-    upi = UpiPaymentDetailsSerializer(required=False)
-    wallet = WalletPaymentDetailsSerializer(required=False)
-
-    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
-        expected = _DETAILS_FIELD[attrs["method"]]
-        sent = [name for name in _DETAILS_FIELD.values() if name in attrs]
-        if sent != [expected]:
-            raise serializers.ValidationError({expected: f"Send {expected} details, and only those, for this method."})
-        return attrs
-
-    def method_details(self) -> dict[str, Any]:
-        """The validated details of the chosen method, enums as names, ready for the payment context."""
-        details = self.validated_data[_DETAILS_FIELD[self.validated_data["method"]]]
-        return {name: value.name if isinstance(value, WalletProvider) else value for name, value in details.items()}
+class BookingPaymentSerializer(PaymentMethodRequestSerializer):
+    """The pay body: the method and exactly one matching details object (payment's published shape);
+    ``method_payload()`` hands them on, and the payment context validates the details."""
 
 
 class BookingCancelSerializer(BaseHotelSerializer):
@@ -170,8 +138,8 @@ class BookingSerializer(BaseHotelSerializer):
     nightly_rates = BookingNightlyRateSerializer(source="price.nightly_rates", many=True, read_only=True)
     pricing_strategy = HotelEnumField(PricingStrategyCode, source="price.pricing_strategy", read_only=True)
     cancellation_policy = HotelEnumField(CancellationPolicyCode, read_only=True)
-    hold_expires_at = HotelDateTimeField(read_only=True)
-    payment_id = HotelUUIDField(read_only=True)
+    hold_expires_at = HotelDateTimeField(read_only=True, allow_null=True, help_text="Null unless prepaid.")
+    payment_id = HotelUUIDField(read_only=True, allow_null=True)
     refund = BookingRefundSerializer(source="*", read_only=True)
     guest_name = HotelEncryptedCharField(
         source="contact.name", read_only=True, read_roles=[Role.ADMIN], subject_attr="guest_id", mask_as=PiType.NAME
@@ -182,28 +150,19 @@ class BookingSerializer(BaseHotelSerializer):
     guest_phone = HotelEncryptedCharField(
         source="contact.phone", read_only=True, read_roles=[Role.ADMIN], subject_attr="guest_id", mask_as=PiType.PHONE
     )
-    last_payment_failure = HotelCharField(read_only=True)
+    last_payment_failure = HotelCharField(read_only=True, allow_null=True)
     created_at = HotelDateTimeField(read_only=True)
-    confirmed_at = HotelDateTimeField(read_only=True)
-    cancelled_at = HotelDateTimeField(read_only=True)
-    expired_at = HotelDateTimeField(read_only=True)
-
-
-class BookingPageSerializer(BaseHotelSerializer):
-    """Documents the paged list ``data``; the view builds it with ``page_data``."""
-
-    items = BookingSerializer(many=True, read_only=True)
-    page = HotelIntegerField(read_only=True)
-    page_size = HotelIntegerField(read_only=True)
-    total = HotelIntegerField(read_only=True)
+    confirmed_at = HotelDateTimeField(read_only=True, allow_null=True)
+    cancelled_at = HotelDateTimeField(read_only=True, allow_null=True)
+    expired_at = HotelDateTimeField(read_only=True, allow_null=True)
 
 
 class PaymentSummarySerializer(BaseHotelSerializer):
     payment_id = HotelUUIDField(read_only=True)
     status = HotelCharField(read_only=True, help_text="Payment status, e.g. SUCCEEDED or FAILED.")
     instrument = HotelCharField(source="instrument_display", read_only=True, help_text='e.g. "VISA •••• 4242".')
-    failure_code = HotelCharField(read_only=True)
-    failure_message = HotelCharField(read_only=True)
+    failure_code = HotelCharField(read_only=True, allow_null=True)
+    failure_message = HotelCharField(read_only=True, allow_null=True)
 
 
 class BookingPaymentResultSerializer(BaseHotelSerializer):

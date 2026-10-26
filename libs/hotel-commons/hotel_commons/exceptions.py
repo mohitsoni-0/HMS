@@ -62,11 +62,28 @@ class BusinessRuleViolation(AppError):
     """A well-formed request that a business rule rejects (422)."""
 
 
-class TooManyRequests(AppError):
-    """Rate limit hit (429). ``retry_after_seconds`` feeds the Retry-After header and the message.
+class RetryLater(AppError):
+    """A transient condition the client should simply retry, such as a lock or statement timeout (409 / 503).
 
-    The wait is rounded up to whole seconds (HTTP delta-seconds), so a client never retries too early.
+    ``retry_after_seconds`` feeds the Retry-After header, rounded up to whole seconds (HTTP delta-seconds) so
+    a client never retries too early. A timeout is expected under load: the API logs it as a warning, not a bug.
     """
+
+    def __init__(
+        self,
+        status_code: StatusCode,
+        /,
+        *,
+        retry_after_seconds: float = 1,
+        errors: Mapping[str, Any] | None = None,
+        **params: Any,
+    ) -> None:
+        self.retry_after_seconds = max(0, math.ceil(retry_after_seconds))
+        super().__init__(status_code, errors=errors, **params)
+
+
+class TooManyRequests(RetryLater):
+    """Rate limit hit (429). ``retry_after_seconds`` feeds the Retry-After header and the message."""
 
     def __init__(
         self,
@@ -77,9 +94,8 @@ class TooManyRequests(AppError):
         errors: Mapping[str, Any] | None = None,
         **params: Any,
     ) -> None:
-        self.retry_after_seconds = max(0, math.ceil(retry_after_seconds))
-        params.setdefault("retry_after", self.retry_after_seconds)
-        super().__init__(status_code, errors=errors, **params)
+        params.setdefault("retry_after", max(0, math.ceil(retry_after_seconds)))
+        super().__init__(status_code, retry_after_seconds=retry_after_seconds, errors=errors, **params)
 
 
 class SecurityFailure(AppError):

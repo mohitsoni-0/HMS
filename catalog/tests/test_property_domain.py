@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from hotel_commons.domain.money import Money
+from hotel_commons.domain.validation import is_indian_mobile, is_valid_email, normalize_email
 from hotel_commons.exceptions import BusinessRuleViolation, Conflict, ValidationFailed
 
 from catalog.domain.owner_account import ContactDetails
@@ -113,6 +114,17 @@ def test_duplicate_room_type_name_case_insensitive():
     assert len(resort.room_types) == 1
 
 
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("ΟΔΟΣ", "οδοσ"), ("Straße Suite", "STRASSE SUITE"), ("Deluxe  Sea\tView", "deluxe sea view")],
+)
+def test_duplicate_room_type_name_uses_casefold_and_whitespace_normalisation(first, second):
+    with pytest.raises(Conflict) as error:
+        onboard(property_draft(room_types=(room_type_draft(first), room_type_draft(second))))
+
+    assert error.value.status_code == DUPLICATE_ROOM_TYPE_NAME
+
+
 def test_unknown_amenities_rejected():
     with pytest.raises(ValidationFailed) as on_property:
         onboard(property_draft(amenity_codes=frozenset({"WIFI", "HELIPAD"})))
@@ -146,3 +158,32 @@ def test_contact_details_repr_hides_pii():
 
     assert "owner@example.com" not in repr(contact)
     assert "9876543210" not in repr(contact)
+
+
+@pytest.mark.parametrize(
+    ("email", "phone"),
+    [
+        ("Owner@Example.com ", "9876543210"),
+        ("a@mail.co.", "9876543210"),
+        ("a@b.c", "6000000000"),
+        ("owner@example.com", "५८७६५४३२१०"),  # non-ASCII digits
+        ("owner@example.com", "98765432100"),
+    ],
+)
+def test_contact_details_follow_the_shared_contact_rules(email, phone):
+    shared_ok = is_valid_email(normalize_email(email)) and is_indian_mobile(phone.strip())
+
+    try:
+        ContactDetails(email=email, phone=phone)
+        accepted = True
+    except ValidationFailed:
+        accepted = False
+
+    assert accepted is shared_ok
+
+
+def test_contact_details_delegate_to_hotel_commons_validation(monkeypatch):
+    monkeypatch.setattr("catalog.domain.owner_account.is_valid_email", lambda value: False)
+
+    with pytest.raises(ValidationFailed):
+        ContactDetails(email="owner@example.com", phone="9876543210")

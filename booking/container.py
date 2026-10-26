@@ -54,7 +54,13 @@ def create_booking_service() -> CreateBookingService:
 @cache
 def pay_booking_service() -> PayBookingService:
     return PayBookingService(
-        DjangoBookingRepository(), PaymentAdapter(), InventoryAdapter(), event_bus, DjangoUnitOfWork(), SystemClock()
+        DjangoBookingRepository(),
+        PaymentAdapter(),
+        InventoryAdapter(),
+        BookingTypeRegistry(),
+        event_bus,
+        DjangoUnitOfWork(),
+        SystemClock(),
     )
 
 

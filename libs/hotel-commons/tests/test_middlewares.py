@@ -32,6 +32,11 @@ from django.db import DatabaseError  # noqa: E402
 from django.http import Http404, HttpResponse  # noqa: E402
 from django.test import RequestFactory, override_settings  # noqa: E402
 from redis.exceptions import ConnectionError as RedisConnectionError  # noqa: E402
+from django.urls import path  # noqa: E402
+from drf_spectacular.generators import SchemaGenerator  # noqa: E402
+from drf_spectacular.utils import extend_schema  # noqa: E402
+from rest_framework import serializers  # noqa: E402
+from rest_framework.exceptions import ValidationError as DrfValidationError  # noqa: E402
 from rest_framework.response import Response  # noqa: E402
 from rest_framework.test import APIRequestFactory  # noqa: E402
 from rest_framework.views import APIView  # noqa: E402
@@ -39,10 +44,13 @@ from rest_framework.views import APIView  # noqa: E402
 from hotel_commons.api import system_views, throttling  # noqa: E402
 from hotel_commons.api.authentication import PrincipalAuthentication  # noqa: E402
 from hotel_commons.api.error_views import not_found, server_error  # noqa: E402
+from hotel_commons.api.exception_handler import envelope_exception_handler  # noqa: E402
+from hotel_commons.api.response import flatten_errors  # noqa: E402
+from hotel_commons.api.schema import ERROR_ENVELOPE, envelope, envelope_list  # noqa: E402
 from hotel_commons.api.throttling import RedisRateLimitThrottle  # noqa: E402
 from hotel_commons.api.views import BaseViewSet  # noqa: E402
 from hotel_commons.context import RequestContext  # noqa: E402
-from hotel_commons.exceptions import NotFound, TooManyRequests  # noqa: E402
+from hotel_commons.exceptions import NotFound, TooManyRequests, ValidationFailed  # noqa: E402
 from hotel_commons.management.commands.mint_token import Command as MintTokenCommand  # noqa: E402
 from hotel_commons.middlewares.authentication import JWTAuthenticationMiddleware  # noqa: E402
 from hotel_commons.middlewares.exception_handling import ExceptionHandlingMiddleware  # noqa: E402
@@ -57,6 +65,7 @@ from hotel_commons.security.principal import ANONYMOUS, Principal, Role  # noqa:
 from hotel_commons.status_code import (  # noqa: E402
     FORBIDDEN,
     INTERNAL_ERROR,
+    METHOD_NOT_ALLOWED,
     NOT_FOUND,
     RATE_LIMITED,
     RESOURCE_NOT_FOUND,
@@ -195,6 +204,37 @@ def test_app_error_becomes_its_json_envelope():
     assert response["Content-Type"] == "application/json"
     assert _body(response) == {"status": RESOURCE_NOT_FOUND.code, "message": "booking not found",
                                "errors": None, "data": None, "request_id": "req-1"}
+
+
+def test_domain_field_errors_become_lists_of_messages():
+    """A domain ``ValidationFailed`` maps a field to one string; the envelope always carries a list (A5)."""
+    response = _handled(ValidationFailed(VALIDATION_FAILED, errors={"card.card_number": "is invalid"}))
+
+    assert _body(response)["errors"] == {"card.card_number": ["is invalid"]}
+
+
+def test_drf_validation_errors_are_keyed_by_dotted_path():
+    detail = {
+        "card": {"card_number": ["Enter a valid card number."], "cvv": ["This field is required."]},
+        "room_types": [{}, {"base_price": ["Must be at least 1.00."]}],
+        "amenities": {2: ["Unknown code."]},
+        "non_field_errors": ["Send card details, and only those."],
+    }
+
+    response = envelope_exception_handler(DrfValidationError(detail), {})
+
+    assert response.data["errors"] == {
+        "card.card_number": ["Enter a valid card number."],
+        "card.cvv": ["This field is required."],
+        "room_types.1.base_price": ["Must be at least 1.00."],
+        "amenities.2": ["Unknown code."],
+        "non_field_errors": ["Send card details, and only those."],
+    }
+    assert all(type(message) is str for messages in response.data["errors"].values() for message in messages)
+
+
+def test_flatten_errors_keeps_every_message():
+    assert flatten_errors({"a": ["x", {"b": "y"}], "c": None, "d": 3}) == {"a": ["x"], "a.1.b": ["y"], "d": ["3"]}
 
 
 def test_too_many_requests_carries_retry_after():
@@ -378,6 +418,17 @@ def test_throttle_scope_defaults_to_default(limiter):
     _viewset_get({"get": "overview"}, GUEST)
 
     assert limiter.hits == [("default", "u:guest-1")]
+
+
+def test_options_is_a_405_envelope_not_a_500(limiter):
+    """DRF's metadata would build a serializer for the POST action of a viewset that has none (review S7)."""
+    request = APIRequestFactory().options("/hotel/v1/bookings")
+    request.principal = GUEST
+
+    response = BookingsViewSet.as_view({"get": "overview", "post": "manage"})(request)
+
+    assert (response.status_code, response.data["status"]) == (405, METHOD_NOT_ALLOWED.code)
+    assert response.data["message"] == "Method OPTIONS not allowed"
 
 
 def test_rate_limit_headers_follow_the_decision():
@@ -579,3 +630,71 @@ def test_mint_token_prints_a_verifiable_token():
 def test_mint_token_rejects_bad_input(arguments):
     with pytest.raises(CommandError):
         call_command(MintTokenCommand(), *arguments, stdout=io.StringIO())
+
+
+# --- OpenAPI envelopes (hotel_commons.api.schema) ----------------------------------------------------------
+
+
+class _ThingSerializer(serializers.Serializer):
+    name = serializers.CharField()
+
+
+class ThingsViewSet(BaseViewSet):
+    @extend_schema(responses={200: envelope_list(_ThingSerializer, "ThingPageEnvelope", paginated=True),
+                              400: ERROR_ENVELOPE})
+    def list(self, request):
+        return Response({})
+
+    @extend_schema(responses={200: envelope_list(_ThingSerializer, "ThingListEnvelope")})
+    def names(self, request):
+        return Response({})
+
+    @extend_schema(responses={200: envelope(_ThingSerializer(many=True), "LegacyThingListEnvelope")})
+    def legacy(self, request):
+        return Response({})
+
+
+def _schema_of(actions: dict[str, str], route: str) -> tuple[dict, dict]:
+    generator = SchemaGenerator(patterns=[path(route, ThingsViewSet.as_view(actions))])
+    document = generator.get_schema(request=None, public=True)
+    return document, document["paths"][f"/{route}"]["get"]["responses"]
+
+
+def test_a_list_action_documents_one_envelope_object_not_an_array():
+    document, responses = _schema_of({"get": "list"}, "things")
+
+    ok = responses["200"]["content"]["application/json"]["schema"]
+    assert ok == {"$ref": "#/components/schemas/ThingPageEnvelope"}  # was {"type": "array", "items": ...}
+    page = document["components"]["schemas"]["ThingPageData"]
+    assert set(page["properties"]) == {"items", "page", "page_size", "total"}
+    assert page["properties"]["items"]["type"] == "array"
+    assert responses["400"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/ErrorEnvelope"}
+
+
+def test_envelope_list_without_pagination_holds_an_array_of_items():
+    document, responses = _schema_of({"get": "names"}, "names")
+
+    ok = responses["200"]["content"]["application/json"]["schema"]
+    assert ok == {"$ref": "#/components/schemas/ThingListEnvelope"}
+    data = document["components"]["schemas"]["ThingListEnvelope"]["properties"]["data"]
+    assert data["type"] == "array"
+    assert data["items"] == {"$ref": "#/components/schemas/_Thing"}
+
+
+def test_plain_envelope_on_a_list_action_is_not_wrapped_either():
+    class LegacyViewSet(ThingsViewSet):
+        list = ThingsViewSet.legacy  # documented with envelope(X(many=True), ...), as list views used to be
+
+    generator = SchemaGenerator(patterns=[path("legacy", LegacyViewSet.as_view({"get": "list"}))])
+    document = generator.get_schema(request=None, public=True)
+
+    ok = document["paths"]["/legacy"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert ok == {"$ref": "#/components/schemas/LegacyThingListEnvelope"}
+
+
+def test_error_envelope_documents_dotted_paths_to_message_lists():
+    document, _ = _schema_of({"get": "list"}, "things")
+
+    errors = document["components"]["schemas"]["ErrorEnvelope"]["properties"]["errors"]
+    assert errors["additionalProperties"] == {"type": "array", "items": {"type": "string"}}
+    assert errors["nullable"] is True

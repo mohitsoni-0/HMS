@@ -81,8 +81,13 @@ class RefundResult:
 
 class PaymentPort(ABC):
     @abstractmethod
-    def find_charge(self, idempotency_key: str) -> ChargeResult | None:
-        """The charge already made under ``idempotency_key``, from Postgres: replay works without Redis."""
+    def find_charge(
+        self, idempotency_key: str, method: str, method_details: Mapping[str, Any]
+    ) -> ChargeResult | None:
+        """The charge already made under ``idempotency_key``, from Postgres: replay works without Redis.
+
+        BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED) when that charge was made with a different method or
+        details: the payment context compares fingerprints, booking never stores the instrument."""
 
     @abstractmethod
     def charge(self, request: ChargeRequest) -> ChargeResult:

@@ -2,9 +2,11 @@
 
 The client draws a fresh AES-256 key per request, wraps it with the server's RSA public key
 (``X-Encrypted-Key``) and seals the JSON body as ``{"payload": "<b64(nonce | ciphertext | tag)>"}``. The
-associated data ``v1|<direction>|<METHOD>|<path>|<timestamp>`` binds every payload to its direction, method,
-path and timestamp, so a body cannot be replayed against another endpoint or turned into a response. The
-server answers with the same AES key, a new nonce and the ``res`` direction.
+associated data ``v1|<direction>|<METHOD>|<target>|<timestamp>`` binds every payload to its direction, method,
+target and timestamp, so a body cannot be replayed against another endpoint or query, or turned into a
+response. The target is the URL path, plus ``?`` and the raw query string when there is one. The server
+answers with the same AES key, a new nonce and the ``res`` direction. A method outside ``BODYLESS_METHODS``
+must carry a sealed body (``{}`` when it has nothing to send), so stripping the body is detected.
 
 Every failure to open a payload is the same ``ValidationFailed(PAYLOAD_DECRYPTION_FAILED)``, so a caller
 learns nothing about which check failed.
@@ -39,6 +41,7 @@ WIRE_VERSION: Final = "v1"
 ALGORITHM: Final = "RSA-OAEP-256+A256GCM"
 PAYLOAD_FIELD: Final = "payload"
 MAX_CLOCK_SKEW_SECONDS: Final = 300
+BODYLESS_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
 MIN_RSA_KEY_BITS: Final = 3072
 AES_KEY_BYTES: Final = 32
 _NONCE_BYTES: Final = 12
@@ -51,9 +54,19 @@ def _oaep() -> padding.OAEP:
     return padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
 
 
-def payload_aad(direction: Direction, method: str, path: str, timestamp: int) -> str:
-    """The associated data of one payload: ``v1|req|POST|/hotel/v1/bookings|1767000000``."""
-    return f"{WIRE_VERSION}|{direction}|{method.upper()}|{path}|{timestamp}"
+def aad_target(path: str, query: str) -> str:
+    """The request target bound into the AAD: ``path``, or ``path?query`` when the raw query string is not empty."""
+    return f"{path}?{query}" if query else path
+
+
+def payload_aad(direction: Direction, method: str, target: str, timestamp: int) -> str:
+    """The associated data of one payload: ``v1|req|GET|/hotel/v1/bookings?property_id=…|1767000000``."""
+    return f"{WIRE_VERSION}|{direction}|{method.upper()}|{target}|{timestamp}"
+
+
+def requires_sealed_body(method: str) -> bool:
+    """Whether an encrypted request with this method must carry a sealed body (every method but GET/HEAD/OPTIONS)."""
+    return method.upper() not in BODYLESS_METHODS
 
 
 def seal(aes_key: bytes, plaintext: bytes, *, aad: str) -> str:
@@ -71,7 +84,7 @@ def open_sealed(aes_key: bytes, payload_b64: str, *, aad: str) -> bytes:
     try:
         return AESGCM(aes_key).decrypt(payload[:_NONCE_BYTES], payload[_NONCE_BYTES:], aad.encode())
     except InvalidTag:
-        raise _rejected("authentication failed (tampered payload or wrong method, path or timestamp)") from None
+        raise _rejected("authentication failed (tampered payload or wrong method, target or timestamp)") from None
 
 
 class HybridPayloadCipher:
@@ -113,7 +126,10 @@ class HybridPayloadCipher:
 
 @dataclass(frozen=True)
 class EncryptedRequest:
-    """What a client sends (``headers``, ``body``) and keeps to open the response (``aes_key`` and the AAD parts)."""
+    """What a client sends (``headers``, ``body``) and keeps to open the response (``aes_key`` and the AAD parts).
+
+    ``path`` is the AAD target: the URL path plus ``?query`` when the request has a query string.
+    """
 
     headers: dict[str, str]
     body: dict[str, str] | None
@@ -126,7 +142,7 @@ class EncryptedRequest:
 class HybridPayloadClient:
     """Client side, for tests and ``scripts/encrypted_request.py``: encrypts requests and opens responses.
 
-    ``path`` is the URL path the server sees; a query string, if given, is not part of the AAD.
+    ``path`` is the URL the server sees, path and optional query string; both are part of the AAD.
     """
 
     def __init__(self, server_public_key_pem: bytes, *, clock: Callable[[], float] = time.time) -> None:
@@ -137,23 +153,29 @@ class HybridPayloadClient:
         self._clock = clock
 
     def encrypt_request(self, method: str, path: str, body: Mapping[str, Any] | None) -> EncryptedRequest:
-        """A fresh AES key wrapped for the server, the v1 headers and, unless ``body`` is None, the sealed body."""
+        """A fresh AES key wrapped for the server, the v1 headers and the sealed body.
+
+        ``body`` None sends no body for GET/HEAD/OPTIONS and a sealed ``{}`` for any other method.
+        """
         method = method.upper()
-        url_path = urlsplit(path).path
+        url = urlsplit(path)
+        target = aad_target(url.path, url.query)
         timestamp = int(self._clock())
+        if body is None and requires_sealed_body(method):
+            body = {}
         aes_key = AESGCM.generate_key(bit_length=AES_KEY_BYTES * 8)
         wrapped_key = base64.b64encode(self._public_key.encrypt(aes_key, _oaep())).decode("ascii")
         sealed_body = None
         if body is not None:
             plaintext = json.dumps(body, separators=(",", ":")).encode()
-            sealed_body = {PAYLOAD_FIELD: seal(aes_key, plaintext, aad=payload_aad("req", method, url_path, timestamp))}
+            sealed_body = {PAYLOAD_FIELD: seal(aes_key, plaintext, aad=payload_aad("req", method, target, timestamp))}
         headers = {
             PAYLOAD_ENCRYPTION_HEADER: WIRE_VERSION,
             ENCRYPTED_KEY_HEADER: wrapped_key,
             PAYLOAD_TIMESTAMP_HEADER: str(timestamp),
         }
         return EncryptedRequest(
-            headers=headers, body=sealed_body, aes_key=aes_key, method=method, path=url_path, timestamp=timestamp
+            headers=headers, body=sealed_body, aes_key=aes_key, method=method, path=target, timestamp=timestamp
         )
 
     def decrypt_response(self, request: EncryptedRequest, response_body: Mapping[str, Any]) -> dict[str, Any]:

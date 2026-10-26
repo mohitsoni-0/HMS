@@ -67,12 +67,13 @@ class InMemoryRoomNightRepository(RoomNightRepository):
                 result[room_type_id] = min(night.available for night in nights)
         return result
 
-    def occupancy(self, room_type_id: UUID, dates: Sequence[date]) -> dict[date, Decimal]:
-        return {
-            stay_date: self.rows[(room_type_id, stay_date)].occupancy
-            for stay_date in dates
-            if (room_type_id, stay_date) in self.rows
-        }
+    def occupancy_many(self, room_type_ids: Sequence[UUID], dates: Sequence[date]) -> dict[UUID, dict[date, Decimal]]:
+        occupancy: dict[UUID, dict[date, Decimal]] = {}
+        for room_type_id in room_type_ids:
+            known = {d: self.rows[(room_type_id, d)].occupancy for d in dates if (room_type_id, d) in self.rows}
+            if known:
+                occupancy[room_type_id] = known
+        return occupancy
 
     def night(self, room_type_id: UUID, stay_date: date) -> RoomNight | None:
         """Test helper: the stored night, or None when it was never provisioned."""

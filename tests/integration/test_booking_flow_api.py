@@ -32,10 +32,12 @@ THURSDAY = 3
 
 CONTACT = {"guest_name": "Rahul Sharma", "guest_email": "rahul@example.com", "guest_phone": "9876543210"}
 MASKED_CONTACT = {"guest_name": "R**** S*****", "guest_email": "r****@example.com", "guest_phone": "******3210"}
+# The payment container validates expiry against the real clock, so the card is always two years from valid.
+CARD_EXPIRY_YEAR = SystemClock().today().year + 2
 CARD = {
     "card_number": "4242424242424242",
     "expiry_month": 12,
-    "expiry_year": 2030,
+    "expiry_year": CARD_EXPIRY_YEAR,
     "cvv": "123",
     "holder_name": "Rahul Sharma",
 }

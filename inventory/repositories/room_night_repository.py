@@ -69,9 +69,22 @@ class DjangoRoomNightRepository(RoomNightRepository):
         )
         return {row["room_type_id"]: row["min_avail"] for row in rows}
 
-    def occupancy(self, room_type_id: UUID, dates: Sequence[date]) -> dict[date, Decimal]:
-        rows = RoomNightModel.objects.filter(room_type_id=room_type_id, stay_date__in=dates)
-        return {row.stay_date: room_night_to_domain(row).occupancy for row in rows}
+    def occupancy_many(self, room_type_ids: Sequence[UUID], dates: Sequence[date]) -> dict[UUID, dict[date, Decimal]]:
+        """One SELECT over every room type: only the counters, not whole rows."""
+        if not room_type_ids or not dates:
+            return {}
+        rows = (
+            RoomNightModel.objects.filter(room_type_id__in=room_type_ids, stay_date__in=dates)
+            .order_by()
+            .values_list("room_type_id", "stay_date", "total_rooms", "reserved_rooms")
+        )
+        occupancy: dict[UUID, dict[date, Decimal]] = {}
+        for room_type_id, stay_date, total_rooms, reserved_rooms in rows:
+            night = RoomNight(
+                room_type_id=room_type_id, stay_date=stay_date, total_rooms=total_rooms, reserved_rooms=reserved_rooms
+            )
+            occupancy.setdefault(room_type_id, {})[stay_date] = night.occupancy
+        return occupancy
 
 
 def _stay_nights(room_type_id: UUID, stay: DateRange) -> QuerySet[RoomNightModel]:

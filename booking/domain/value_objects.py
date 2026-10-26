@@ -4,28 +4,25 @@
 the adapters build them from the other contexts' DTOs, so the domain never sees those types.
 """
 
-import re
 from dataclasses import dataclass, field
 from datetime import date, time
-from typing import Final
 from uuid import UUID
 
 from catalog.public.enums import CancellationPolicyCode, PricingStrategyCode
 from hotel_commons.domain.money import Money
+from hotel_commons.domain.validation import is_indian_mobile, is_valid_email
 from hotel_commons.exceptions import ValidationFailed
 
 from booking.constants import GUEST_NAME_MAX_LENGTH, GUEST_NAME_MIN_LENGTH
 from booking.status_code import INVALID_BOOKING_REQUEST
-
-_EMAIL: Final = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
-_INDIAN_MOBILE: Final = re.compile(r"[6-9][0-9]{9}")
 
 
 @dataclass(frozen=True, slots=True)
 class GuestContact:
     """The guest's contact details. PII: excluded from repr, encrypted at rest, masked for owners.
 
-    Errors name the field, never its value.
+    Errors name the field, never its value. The e-mail and mobile rules are the shared ones of
+    ``hotel_commons.domain.validation``, so a guest is checked exactly like an owner or a wallet holder.
     """
 
     name: str = field(repr=False)
@@ -35,9 +32,9 @@ class GuestContact:
     def __post_init__(self) -> None:
         if not GUEST_NAME_MIN_LENGTH <= len(self.name.strip()) <= GUEST_NAME_MAX_LENGTH:
             raise _invalid_contact(f"guest_name must be {GUEST_NAME_MIN_LENGTH}-{GUEST_NAME_MAX_LENGTH} characters")
-        if not _EMAIL.fullmatch(self.email):
+        if not is_valid_email(self.email):
             raise _invalid_contact("guest_email must be a valid e-mail address")
-        if not _INDIAN_MOBILE.fullmatch(self.phone):
+        if not is_indian_mobile(self.phone):
             raise _invalid_contact("guest_phone must be a 10-digit mobile number starting with 6-9")
 
 

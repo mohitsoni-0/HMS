@@ -19,14 +19,20 @@ hotel-booking-service/
 │   ├── pyproject.toml
 │   ├── hotel_commons/                # §3
 │   └── tests/
-├── tests/                            # cross-app tests
-│   ├── architecture/test_module_boundaries.py      (optional, built last)
+├── tests/                            # cross-app tests (§14)
+│   ├── architecture/test_module_boundaries.py      # AST walk: public-only cross-app imports, acyclic graph
+│   ├── contract/test_openapi_schema.py             # schema validates, no warnings; responses match it
+│   ├── infra/                                      # entrypoint, compose ports, bootstrap_env.py, card fixtures
+│   ├── integration/conftest.py                     # truncate_context_tables for transaction=True tests
 │   ├── integration/test_booking_flow_api.py
+│   ├── integration/test_booking_edge_cases_api.py
+│   ├── integration/test_booking_concurrency.py
 │   ├── integration/test_common_fields_and_logs.py
 │   └── integration/test_inventory_concurrency.py
 ├── secrets/dev/api_rsa_private.pem   # DEV-ONLY key for local runs; refused when ENVIRONMENT != local
+├── secrets/local/                    # git-ignored: keys written by scripts/bootstrap_env.py
 ├── docs/HLD.md  docs/LLD.md
-├── scripts/bootstrap_env.py          # optional: generate fresh local keys into .env + secrets/
+├── scripts/bootstrap_env.py          # fresh random keys into .env + an RSA-3072 key in secrets/local/ (--force)
 ├── scripts/encrypted_request.py      # demo client for API payload encryption
 ├── conftest.py  pytest.ini  .coveragerc
 ├── requirements.txt  requirements-dev.txt
@@ -113,8 +119,9 @@ hotel_commons/
 ├── status_code.py           # StatusCode + common codes
 ├── exceptions.py            # AppError hierarchy (no Django imports)
 ├── context.py               # RequestContext over ContextVars
-├── domain/                  # money.py, date_range.py, clock.py, unit_of_work.py
-├── db/                      # unit_of_work.py (DjangoUnitOfWork), schema.py (schema_table, create_schema_operation)
+├── domain/                  # money.py, date_range.py, clock.py, unit_of_work.py, validation.py (contact rules)
+├── db/                      # unit_of_work.py (DjangoUnitOfWork), schema.py (schema_table, create_schema_operation),
+│                            # errors.py (lock/statement timeout -> RetryLater), backends/postgresql/ (schema-aware)
 ├── serializers/             # fields.py (Hotel*Field), base.py (BaseHotelSerializer, BaseHotelModelSerializer)
 ├── models/                  # base.py, managers.py, log_model.py, fields.py, pii_companions.py
 ├── security/                # __init__.py (EMPTY, no re-exports), principal.py, pi_type.py, pii.py,
@@ -174,6 +181,8 @@ INTERNAL_ERROR            = StatusCode(2100015, "Please try again after some tim
 LOG_MODEL_NOT_FOUND       = StatusCode(2100016, "Invalid log model configured for {model}", 500)
 METHOD_NOT_ALLOWED        = StatusCode(2100017, "Method {method} not allowed", 405)
 NOT_FOUND                 = StatusCode(2100018, "Resource not found", 404)
+RESOURCE_BUSY             = StatusCode(2100019, "The resource is busy, please retry", 409)       # SQLSTATE 55P03
+SERVICE_TIMEOUT           = StatusCode(2100020, "The request took too long, please retry", 503)  # SQLSTATE 57014
 ```
 
 ```python
@@ -192,7 +201,8 @@ class Forbidden(AppError): ...
 class NotFound(AppError): ...
 class Conflict(AppError): ...
 class BusinessRuleViolation(AppError): ...
-class TooManyRequests(AppError): ...          # extra kw: retry_after_seconds (sets Retry-After)
+class RetryLater(AppError): ...               # extra kw: retry_after_seconds (sets Retry-After); lock/statement timeout
+class TooManyRequests(RetryLater): ...        # 429 rate limit
 class SecurityFailure(AppError): ...
 class UpstreamFailure(AppError): ...          # e.g. payment gateway refund failure (502)
 ```
@@ -511,10 +521,10 @@ Wire format (v1):
 | Item | Value |
 |---|---|
 | Request headers | `X-Payload-Encryption: v1`, `X-Encrypted-Key: <b64 RSA-OAEP(aes_key)>`, `X-Payload-Timestamp: <unix seconds>` (±300 s) |
-| Request body | `{"payload": "<b64(nonce ‖ ciphertext ‖ tag)>"}`; GET/DELETE may have an empty body |
-| Request AAD | `v1\|req\|{METHOD}\|{path}\|{ts}` |
-| Response | header `X-Payload-Encryption: v1`, body `{"payload": ...}`, AAD `v1\|res\|{METHOD}\|{path}\|{ts}`, same AES key, new nonce |
-| Replay guard | `SET hb:enc:v1:{sha256(X-Encrypted-Key)} 1 NX EX 300`; already present → 400 `PAYLOAD_DECRYPTION_FAILED` |
+| Request body | `{"payload": "<b64(nonce ‖ ciphertext ‖ tag)>"}`; required for every method but GET/HEAD/OPTIONS (an encrypted POST without one → 400) |
+| Request AAD | `v1\|req\|{METHOD}\|{target}\|{ts}`, where `target` is the path, or `path?query` when the raw query string is not empty |
+| Response | header `X-Payload-Encryption: v1`, body `{"payload": ...}`, AAD `v1\|res\|{METHOD}\|{target}\|{ts}`, same AES key, new nonce |
+| Replay guard | `SET hb:enc:v1:{sha256(X-Encrypted-Key)} 1 NX EX 660` (2 × the ±300 s skew + 60 s margin, so it outlives every accepted timestamp); already present → 400 `PAYLOAD_DECRYPTION_FAILED` |
 
 ```python
 # hotel_commons/security/idor.py
@@ -585,7 +595,7 @@ def client_ip(request) -> str: ...
 |---|---|---|
 | 1 | `django.middleware.security.SecurityMiddleware`, `django.middleware.common.CommonMiddleware` | Django defaults (`APPEND_SLASH = False`) |
 | 2 | `hotel_commons.middlewares.request_context.RequestContextMiddleware` | Request id from `X-Request-ID` (≤ 64 chars `[A-Za-z0-9-]`) or a new uuid4 hex. Sets `request.request_id`, binds `RequestContext`, echoes `X-Request-ID`, and resets in `finally`. |
-| 3 | `hotel_commons.middlewares.exception_handling.ExceptionHandlingMiddleware` | Uses `process_exception(request, exc)`. `AppError` → `JsonResponse(error_body(...), status=exc.http_status)`. Anything else → logged, then a 500 `INTERNAL_ERROR` JsonResponse. Never builds a DRF `Response`. |
+| 3 | `hotel_commons.middlewares.exception_handling.ExceptionHandlingMiddleware` | Uses `process_exception(request, exc)`. `AppError` → `JsonResponse(error_body(...), status=exc.http_status)`. A lock or statement timeout (`db.errors.retryable_database_error`) → 409 `RESOURCE_BUSY` / 503 `SERVICE_TIMEOUT` with `Retry-After: 1`, logged as a warning. Anything else → logged, then a 500 `INTERNAL_ERROR` JsonResponse. Never builds a DRF `Response`. |
 | 4 | `hotel_commons.middlewares.api_encryption.ApiEncryptionMiddleware` | `API_ENCRYPTION_MODE` is `off`, `optional` or `enforced`. Exact-path bypass set `API_ENCRYPTION_BYPASS_PATHS`. Before any RSA work it rate-limits by client IP (policy `encrypted`, 300/60 s). With the v1 headers it checks the timestamp, unwraps the key, checks for replay, decrypts and replaces `request._body` (and `CONTENT_TYPE`), and keeps the key on `request`. In `enforced` mode any non-bypass request without the headers gets 400 `PAYLOAD_NOT_ENCRYPTED`. It encrypts the response when the request was encrypted. Its own errors are returned as `JsonResponse`, never raised. |
 | 5 | `hotel_commons.middlewares.authentication.JWTAuthenticationMiddleware` | `Authorization: Bearer <jwt>` → `request.principal`; no header → `ANONYMOUS`. An invalid token returns a 401 `JsonResponse` immediately. Rebinds `RequestContext` with the principal. |
 
@@ -603,7 +613,9 @@ def error_body(status: StatusCode, message: str, errors: Mapping | None = None, 
 
 # hotel_commons/api/exception_handler.py   (REST_FRAMEWORK["EXCEPTION_HANDLER"])
 def envelope_exception_handler(exc, context) -> Response | None: ...
-# AppError -> error body + exc.http_status (Retry-After for TooManyRequests); DRF ValidationError -> 400
+# AppError -> error body + exc.http_status (Retry-After for RetryLater, incl. TooManyRequests);
+# OperationalError with SQLSTATE 55P03 / 57014 -> 409 RESOURCE_BUSY / 503 SERVICE_TIMEOUT + Retry-After: 1;
+# DRF ValidationError -> 400
 # VALIDATION_FAILED with field errors; NotAuthenticated/AuthenticationFailed -> 401; PermissionDenied -> 403;
 # Http404/NotFound -> 404 NOT_FOUND; Throttled -> 429 RATE_LIMITED (+Retry-After); MethodNotAllowed -> 405;
 # anything else -> None (the middleware answers 500)
@@ -627,6 +639,8 @@ class BaseViewSet(GenericViewSet):
     # format negotiation/versioning as DRF does, then:
     # perform_authentication -> check_throttles -> check_permissions -> IdorGuard().check(...)
     def finalize_response(self, request, response, *args, **kwargs): ...   # X-RateLimit-Limit / -Remaining
+    metadata_class = None   # OPTIONS -> 405 METHOD_NOT_ALLOWED after authentication and throttling;
+                            # the contract is published as OpenAPI, not through OPTIONS metadata
 
 # serializer fields live in hotel_commons/serializers/ (§3.14)
 
@@ -641,6 +655,8 @@ class PrincipalAuthenticationScheme(OpenApiAuthenticationExtension):
     name = "BearerAuth"
     def get_security_definition(self, auto_schema): return {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
 def envelope(serializer_or_none, name: str) -> Serializer: ...   # inline_serializer {status, message, request_id, data}
+def envelope_list(serializer_class, name: str, *, paginated: bool = False) -> Serializer: ...
+# list endpoints: data is an array of items, or page_data {items, page, page_size, total} when paginated
 ERROR_ENVELOPE: Serializer                                       # {status, message, errors, data, request_id}
 
 # hotel_commons/api/system_views.py — APIView subclasses, permission AllowAny
@@ -764,14 +780,14 @@ Decorator algorithm, applied to a DRF view method:
    - Set `request.idempotency_key`.
 2. Store key `hb:idem:v1:{scope}:{principal.user_id}:{key}`. Fingerprint = `HMAC-SHA256(IDEMPOTENCY_FINGERPRINT_KEY, f"{METHOD}|{path}|{canonical JSON of request.data}")`.
 3. `begin`:
-   - `RedisError` → log WARNING and run the view without the Redis layer; the Postgres unique keys still apply.
+   - `RedisError` → log WARNING and run the view without the Redis layer. Only the scopes that store the key with their write stay single then: `booking_pay` (payment's unique key + fingerprint) and `booking_create` (unique `(guest_id, idempotency_key)` on the booking); `booking_cancel` and `catalog_write` are best effort.
    - `replay` → return the stored response, its `request_id` set to the retry's own, with header `Idempotent-Replayed: true`.
    - `in_progress` → 409.
    - `mismatch` → 422.
 4. `started` → run the view.
    - An `AppError` it raises becomes a response via `envelope_exception_handler`.
    - Responses below 500 (returned or raised) → `complete()` and return.
-   - 5xx or a non-`AppError` exception → `release()`, then return or re-raise.
+   - 5xx, a `RetryLater` (lock or statement timeout, rate limit) or a non-`AppError` exception → `release()`, then return or re-raise.
    - A `RedisError` from `complete` or `release` is logged and ignored.
 
 Scopes: `booking_create` (optional), `booking_pay` (required), `booking_cancel` (optional), `catalog_write` (optional).
@@ -806,10 +822,10 @@ event_bus = InProcessEventBus()
   - INSTALLED_APPS core: `contenttypes`, `auth`, `staticfiles`, `rest_framework`, `drf_spectacular`, `hotel_commons`.
   - MIDDLEWARE as §3.8. `APPEND_SLASH = False`, `ATOMIC_REQUESTS = False`, `USE_TZ = True`, `TIME_ZONE = "Asia/Kolkata"`.
   - REST_FRAMEWORK: JSON renderer and parser only, `PrincipalAuthentication`, `IsAuthenticatedPrincipal`, `RedisRateLimitThrottle`, `envelope_exception_handler`, `drf_spectacular.openapi.AutoSchema`, `UNAUTHENTICATED_USER: None`.
-  - DATABASES from `POSTGRES_*`, with `CONN_MAX_AGE = 60` and `CONN_HEALTH_CHECKS = True`.
+  - DATABASES from `POSTGRES_*`, engine `hotel_commons.db.backends.postgresql` (§3.15), with `CONN_MAX_AGE = 60` and `CONN_HEALTH_CHECKS = True`. `OPTIONS["options"]` is built from `DB_LOCK_TIMEOUT_MS` (default 2000) and `DB_STATEMENT_TIMEOUT_MS` (default 5000); a value of 0 omits that setting (`docker/entrypoint.sh` runs `migrate` with both at 0).
   - SPECTACULAR_SETTINGS: title and version, `SERVE_PERMISSIONS: ["rest_framework.permissions.AllowAny"]`, `SERVE_AUTHENTICATION: []`, `COMPONENT_SPLIT_REQUEST: True`.
   - **`ENVIRONMENT` defaults to `production`.**
-  - Fail fast with `ImproperlyConfigured` when: `JWT_SIGNING_KEY` is missing or under 32 bytes; any PII key isn't 32 bytes; `PII_ACTIVE_KEY_ID` isn't in the key ring; `PII_BLIND_INDEX_KEY` or `IDEMPOTENCY_FINGERPRINT_KEY` is missing; or the committed dev keys are used while `ENVIRONMENT != "local"`.
+  - Fail fast with `ImproperlyConfigured` when: `JWT_SIGNING_KEY` is missing or under 32 bytes; any PII key isn't 32 bytes; `PII_ACTIVE_KEY_ID` isn't in the key ring; `PII_BLIND_INDEX_KEY` or `IDEMPOTENCY_FINGERPRINT_KEY` is missing or shorter than 32 bytes; or the committed dev keys are used while `ENVIRONMENT != "local"` (secrets are matched against `.env.example`; the dev RSA key is recognised by the SHA-256 fingerprint of its public key, `DEV_RSA_PUBLIC_KEY_SHA256`, and refused only while API encryption is on).
   - A tiny `.env` loader runs `os.environ.setdefault` for each line when a `.env` file exists.
 - **`management/commands/mint_token.py`**: `python manage.py mint_token --sub guest-1 --roles GUEST [--ttl 3600]`.
 - **`testing/`**: `FixedClock`, `NoopUnitOfWork`, `RecordingEventPublisher`, `InMemoryIdempotencyStore`, `InMemoryRateLimiter`, `make_token(user_id, *roles)`, `auth_header(user_id, *roles)`.
@@ -918,6 +934,7 @@ def create_schema_operation(schema: str) -> migrations.RunSQL:
 ```
 
 - Each app's `0001_initial` migration begins with `create_schema_operation("<schema>")`; tables are created schema-qualified.
+- The engine is `hotel_commons.db.backends.postgresql`, Django's backend with a schema-aware introspection and FK removal: Django's own looks tables up by bare name on the search path, so it found no index or foreign key of a `schema_table()` table and a later `AlterField` skipped or failed. `table_names()` keeps Django's behaviour, so `flush` and `TransactionTestCase` leave the context schemas (and the seeded amenity catalogue) alone; transactional tests clean up after themselves (`tests/integration/conftest.py`).
 - Tests run migrations (no `--nomigrations`), so test databases get the schemas too.
 - Index and constraint names are explicit and start with the schema and table, e.g. `catalog_room_type_property_name_uniq`, `payment_refund_log_brin`; a table named like its schema is not repeated (`booking_dates_valid`). Django caps index names at 30 characters, so longer ones are shortened: `booking_status_hold_idx`, `catalog_owner_acc_log_brin`.
 
@@ -934,7 +951,7 @@ def create_schema_operation(schema: str) -> migrations.RunSQL:
 | Keys | UUIDv7 primary keys: time-ordered (B-tree inserts stay right-leaning), globally unique (merge/shard friendly), unguessable |
 | Types | Money `BIGINT` paisa; enums `SMALLINT` with `db_comment` listing values; dates `DATE`; instants `TIMESTAMPTZ` |
 | Hot rows | `inventory.room_night` has one row per room type per night, so contention only happens on the same room type and night. The table uses `fillfactor = 80` so `reserved_rooms` updates stay HOT (no index churn), plus tighter autovacuum settings |
-| Fail fast | The connection sets `lock_timeout = 2s` and `statement_timeout = 5s` (`OPTIONS["options"]`), so a contended booking returns 409/503 quickly instead of queueing |
+| Fail fast | The connection sets `lock_timeout = 2s` and `statement_timeout = 5s` (`OPTIONS["options"]`, from `DB_LOCK_TIMEOUT_MS` / `DB_STATEMENT_TIMEOUT_MS`), so a contended booking returns 409 `RESOURCE_BUSY` / 503 `SERVICE_TIMEOUT` (`Retry-After: 1`) quickly instead of queueing; migrations run with both off |
 | Audit growth | `*_log` tables are append-only with a BRIN index on `creation_date` (tiny, ideal for time-correlated data). When volume demands, they are range-partitioned monthly by `creation_date`; old partitions are detached and archived |
 | Inventory growth | `inventory.room_night` grows by 365 rows per room type per year. Its partition key is `stay_date` (monthly ranges, past months archived); the unique key `(room_type_id, stay_date)` already contains it |
 | Search reads | `discovery.listing` is a denormalised read model with a composite `(city_key, is_active)` index and GIN on `amenity_codes`. It can be served from a read replica (`DATABASE_REPLICA_*` + a router for the discovery app) or moved to OpenSearch without touching writers |
@@ -1232,13 +1249,14 @@ class HoldRepository(ABC):
 - `confirm_hold(hold_id)`: in the unit of work, `get_for_update` → `confirm` → `save`.
 - `release_hold(hold_id, reason)`: in the unit of work, `get_for_update`; if `release()` returned True → `lock_for_stay` → `add_reserved(-rooms)` → `save`. Idempotent.
 - `availability(room_type_ids, stay, rooms) -> dict[UUID, int]`: only room types with minimum availability ≥ `rooms`.
-- `occupancy(room_type_id, dates) -> dict[date, Decimal]`.
+- `occupancy(room_type_id, dates) -> dict[date, Decimal]`; `occupancy_many(room_type_ids, dates) -> dict[UUID, dict[date, Decimal]]` in one query (a night without a row is 0).
+- `booking_window() -> DateRange`: `[today, today + horizon_days]` as a stay range, the stays `hold` accepts (search uses it too).
 
 **Global lock order:** `room_night` rows are always locked ordered by `(room_type_id, stay_date)`, and one transaction never locks the nights of more than one hold.
 
 ### 5.5 Public — `inventory/public/api.py`
 
-`InventoryAPI` exposes `provision`, `extend_horizon`, `hold`, `confirm_hold`, `release_hold`, `availability` and `occupancy`. `HoldView(hold_id: UUID, status: HoldStatus, expires_at: datetime | None)` is in `public/dto.py`. Enums are re-exported from `public/enums.py`. Factory: `get_inventory_api()`. Management command: `extend_inventory_horizon`.
+`InventoryAPI` exposes `provision`, `extend_horizon`, `hold`, `confirm_hold`, `release_hold`, `availability`, `occupancy`, `occupancy_many` and `booking_window`. `HoldView(hold_id: UUID, status: HoldStatus, expires_at: datetime | None)` is in `public/dto.py`. Enums are re-exported from `public/enums.py`. Factory: `get_inventory_api()`. Management command: `extend_inventory_horizon`.
 
 ### 5.6 Tables
 
@@ -1301,6 +1319,9 @@ class PricingStrategyRegistry:
 # pricing/interfaces/ports.py
 class OccupancyPort(ABC):
     def occupancy(self, room_type_id: UUID, nights: Sequence[date]) -> Mapping[date, Decimal]: ...
+    def occupancy_many(self, room_type_ids: Sequence[UUID], nights: Sequence[date]
+                       ) -> Mapping[UUID, Mapping[date, Decimal]]: ...   # one inventory query
+# quote_many prefetches occupancy_many once for all DYNAMIC requests, so a search costs one occupancy query
 
 # pricing/services/pricing_service.py
 class PricingService:
@@ -1613,17 +1634,18 @@ class RefundResult:
     refund_id: UUID
 
 class PaymentPort(ABC):
-    def find_charge(self, idempotency_key: str) -> ChargeResult | None: ...
+    def find_charge(self, idempotency_key: str, method: str, method_details: Mapping[str, Any]
+                    ) -> ChargeResult | None: ...   # BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED) on another body
     def charge(self, request: ChargeRequest) -> ChargeResult: ...
     def refund(self, request: RefundRequest) -> RefundResult: ...   # gateway failure raises UpstreamFailure(REFUND_FAILED)
 ```
 
-Adapters in `booking/adapters/`: `CatalogAdapter` (→ `CatalogAPI`), `PricingAdapter` (→ `PricingAPI`), `InventoryAdapter` (→ `InventoryAPI`), `PaymentAdapter` (→ `PaymentAPI`). Each maps the other context's DTOs to booking's port DTOs; booking never imports another app's enums except catalog's published `PricingStrategyCode` and `CancellationPolicyCode`.
+Adapters in `booking/adapters/`: `CatalogAdapter` (→ `CatalogAPI`), `PricingAdapter` (→ `PricingAPI`), `InventoryAdapter` (→ `InventoryAPI`), `PaymentAdapter` (→ `PaymentAPI`). Each maps the other context's DTOs to booking's port DTOs; booking never imports another app's enums except catalog's published `PricingStrategyCode` and `CancellationPolicyCode`. The pay request body is payment's published `payment.public.serializers.PaymentMethodRequestSerializer` (`BookingPaymentSerializer` subclasses it; `method_payload()` gives `(method name, details)`), so booking holds no per-method code.
 
 ### 8.4 Services
 
 Commands (`booking/services/commands.py`):
-- `CreateBookingCommand(guest_id, room_type_id, check_in, check_out, rooms, guests, booking_type, contact: GuestContact = field(repr=False))`
+- `CreateBookingCommand(guest_id, room_type_id, check_in, check_out, rooms, guests, booking_type, contact: GuestContact = field(repr=False), idempotency_key: str | None = None)`
 - `PayBookingCommand(booking_id, payer_id, method, method_details = field(repr=False), idempotency_key)`
 - `CancelBookingCommand(booking_id, actor_id, reason)`
 
@@ -1632,6 +1654,7 @@ Commands (`booking/services/commands.py`):
 2. `Booking.validate_request(...)` — before any pricing work.
 3. `price = pricing.quote(info, stay, cmd.rooms)`; `booking = Booking.request(...)`.
 4. In the unit of work: `hold_id = inventory.hold(..., reference=str(booking.id), expires_at=type_policy.hold_expires_at(now, settings.hold_ttl))` → `booking.attach_hold(...)` → for PAY_AT_PROPERTY `inventory.confirm_hold(hold_id)` → `bookings.add(booking)` → publish `BookingCreated`.
+5. Durable idempotency: with `cmd.idempotency_key`, an existing booking for `(guest_id, key)` is returned before any work, and the key is stored on the new row under the partial UNIQUE `booking_guest_idempotency_key_uniq`; a concurrent retry that loses the insert (or the last rooms) rolls its own work back and returns the winner's booking.
 
 **`PayBookingService(bookings, payments, inventory, events, uow, clock).execute(cmd) -> PayBookingResult`**
 
@@ -1641,7 +1664,8 @@ Commands (`booking/services/commands.py`):
 key = f"pay:{cmd.booking_id}:{cmd.idempotency_key}"
 with uow:
     booking = bookings.get_for_update(cmd.booking_id)
-    prior = payments.find_charge(key)                         # durable replay, works without Redis
+    prior = payments.find_charge(key, cmd.method, cmd.method_details)  # durable replay, works without Redis;
+                                                              # another body -> 422 IDEMPOTENCY_KEY_REUSED
     if prior: return PayBookingResult(booking, "PAID" if prior.succeeded else "DECLINED", prior)
     if booking.booking_type is PAY_AT_PROPERTY: raise BusinessRuleViolation(BOOKING_NOT_PAYABLE)
     if booking.status is EXPIRED: return PayBookingResult(booking, "EXPIRED", None)
@@ -1688,9 +1712,10 @@ with uow:
 - A PAY_AT_PROPERTY booking is CONFIRMED with no `payment_id`, so it cancels with no refund.
 
 **`ExpireBookingsService(bookings, inventory, events, uow, clock).execute(batch_size=100) -> int`**
-- `ids = bookings.find_expired_pending_ids(now, batch_size)`, outside any transaction.
-- For each id, in its **own** unit of work: `booking = bookings.lock_if_expired_pending(id, now)` (skip if None) → `expire` → `release_hold(..., "EXPIRED")` → `save` → publish `BookingExpired`.
+- Batches of `ids = bookings.find_expired_pending_ids(now, batch_size, ...)`, outside any transaction, until a batch comes back short or the time budget (`EXPIRE_TIME_BUDGET_SECONDS`, 45 s) is spent; an id that failed or was skipped is not picked again in the same run.
+- For each id, in its **own** unit of work: `booking = bookings.lock_if_expired_pending(id, now)` (skip if None, which includes a row locked by a payment: `SKIP LOCKED`) → `expire` → `release_hold(..., "EXPIRED")` → `save` → publish `BookingExpired`.
 - Returns the count. Command: `python manage.py expire_pending_bookings [--batch-size N]`.
+- Booking and payment state never depend on this job (pay expires a lapsed hold itself); availability does: a lapsed hold's rooms stay reserved until this job releases them, i.e. for up to one scheduler interval (HLD §15).
 
 **`BookingQueryService(bookings)`**: `get(booking_id)`, `list_for_guest(...)`, `list_for_property(...)`.
 
@@ -1729,7 +1754,8 @@ with uow:
 | refund_status | smallint | |
 | cancellation_reason | varchar(255) null | |
 | confirmed_at, cancelled_at, expired_at | timestamptz null | |
-| + common fields | | `creation_date` is the booking's `created_at` |
+| idempotency_key | varchar null | the create request's Idempotency-Key; partial UNIQUE (guest_id, idempotency_key) WHERE NOT NULL on the live table |
+| + common fields | | `creation_date` is the booking's `created_at`; owner list index (property_id, creation_date DESC, id DESC) |
 
 ### 8.8 Status codes (2105xxx)
 
@@ -1913,11 +1939,22 @@ class RefundResultDTO:
 
 # api.py
 class PaymentAPI:
-    def find_by_idempotency_key(self, key: str) -> PaymentDTO | None: ...
-    def charge(self, command: ChargeCommand) -> PaymentDTO: ...
+    def find_by_idempotency_key(self, key: str, *, method: str | None = None,
+                                method_details: Mapping | None = None) -> PaymentDTO | None: ...
+    # with method/method_details: a stored request fingerprint that differs ->
+    # BusinessRuleViolation(IDEMPOTENCY_KEY_REUSED); the fingerprint is computed and stored by payment only
+    def charge(self, command: ChargeCommand) -> PaymentDTO: ...   # same check for a key already used
     def refund(self, command: RefundCommand) -> RefundResultDTO: ...   # UpstreamFailure(REFUND_FAILED)
     def get_payment(self, payment_id: UUID) -> PaymentDTO: ...
 def get_payment_api() -> PaymentAPI: ...
+
+# serializers.py — the pay request body other contexts accept (booking's pay serializer subclasses it)
+class PaymentMethodRequestSerializer(BaseHotelSerializer):
+    method = HotelEnumField(PaymentMethod)
+    card = CardPaymentDetailsSerializer(required=False)     # card_number, cvv write_only
+    upi = UpiPaymentDetailsSerializer(required=False)
+    wallet = WalletPaymentDetailsSerializer(required=False)  # exactly one, matching method
+    def method_payload(self) -> tuple[str, dict]: ...        # (method name, inner details dict)
 ```
 
 ### 9.7 Tables
@@ -1937,6 +1974,7 @@ def get_payment_api() -> PaymentAPI: ...
 | gateway_txn_id | varchar(64) null | |
 | failure_code, failure_message | varchar null | |
 | idempotency_key | varchar(200) | UNIQUE on the live table |
+| request_fingerprint | varchar(64) null | HMAC-SHA256 (`IDEMPOTENCY_FINGERPRINT_KEY`) of canonical JSON `{"method", "details"}`; never raw card data. A durable replay with another fingerprint is 422 `IDEMPOTENCY_KEY_REUSED` |
 | + common fields | | |
 
 **`payment.refund`** and `payment.refund_log`: `id`, `payment` FK → payment.payment (RESTRICT), `amount_paisa bigint`, `currency`, `refund_status`, `reason`, `gateway_refund_id`, `idempotency_key` (UNIQUE on the live table), + common fields.
@@ -2021,12 +2059,12 @@ All serializers extend `BaseHotelSerializer` and use `Hotel*Field`s (§3.14). Am
 | `PropertyOnboardSerializer` | `name`, `description` opt, `property_type` HotelEnumField, `star_rating` 1–5 opt, `address` AddressSerializer, `amenities` list[str], `pricing_strategy` HotelEnumField (default STANDARD), `cancellation_policy` HotelEnumField (default MODERATE), `check_in_time` (default 14:00), `check_out_time` (default 11:00), `room_types` list[RoomTypeCreateSerializer] (min 1) |
 | `RoomTypeSerializer` | → `room_type_id`, `name`, `description`, `max_occupancy`, `total_rooms`, `base_price` Amount, `amenities`, `is_active` |
 | `PropertySerializer` | → `property_id`, `owner_account_id`, `name`, `description`, `property_type`, `star_rating`, `address`, `amenities`, `pricing_strategy`, `cancellation_policy`, `check_in_time`, `check_out_time`, `is_active`, `room_types` |
-| `SearchQuerySerializer` | `city` req, `check_in` date req, `check_out` date req (> check_in, ≤ MAX_STAY_NIGHTS), `guests` 1–40 req, `rooms` 1–10 (1), `locality`, `min_price`/`max_price` HotelAmountField(min=0) (min ≤ max), `amenities` comma list, `min_rating` 1–5, `property_types` comma EnumNames, `sort` price_asc\|price_desc\|rating_desc, `page` ≥ 1, `page_size` 1–50 (20) |
-| `SearchPageSerializer` | → `items[]{property_id, name, property_type, star_rating, city, locality, amenities, lowest_nightly_price Amount, offers[]{room_type_id, room_type, max_occupancy, available_rooms, pricing_strategy, nightly_rates[]{date, price Amount}, total Amount, average_nightly Amount}}`, `page`, `page_size`, `total` |
+| `SearchQuerySerializer` | `city` req, `check_in` date req, `check_out` date req (> check_in, ≤ MAX_STAY_NIGHTS; the stay must lie in `InventoryAPI.booking_window()`, checked by `SearchService`, else 400 VALIDATION_FAILED on `check_in`/`check_out`), `guests` 1–40 req, `rooms` 1–10 (1), `locality`, `min_price`/`max_price` HotelAmountField(min=0) (min ≤ max), `amenities` comma list (unknown codes → 400 on `amenities`), `min_rating` 1–5, `property_types` comma EnumNames, `sort` price_asc\|price_desc\|rating_desc, `page` ≥ 1, `page_size` 1–50 (20) |
+| `SearchPageSerializer` | → `items[]{property_id, name, property_type, star_rating, city, locality, amenities (property's plus its room types'), lowest_nightly_price Amount, offers[]{room_type_id, room_type, max_occupancy, available_rooms, pricing_strategy, nightly_rates[]{date, price Amount}, total Amount, average_nightly Amount}}`, `page`, `page_size`, `total` |
 | `BookingCreateSerializer` | `room_type_id` uuid, `check_in`, `check_out` (> check_in, ≤ MAX_STAY_NIGHTS), `rooms` 1–10 (1), `guests` ≥ 1, `booking_type` HotelEnumField (PREPAID), `guest_name` 2–100, `guest_email` email, `guest_phone` ^[6-9]\d{9}$, `on_behalf_of_user_id` opt. `on_behalf_of_user_id` is `HotelCharField(restrict_roles=[ADMIN])` (403 for anyone else) |
 | `BookingListQuerySerializer` | `property_id` uuid opt, `guest_id` opt (ADMIN), `page`, `page_size` |
 | `BookingSerializer` | → `booking_id`, `status`, `booking_type`, `property_id`, `room_type_id`, `check_in`, `check_out`, `nights`, `rooms`, `guests`, `total` Amount, `nightly_rates[]{date, price}`, `pricing_strategy`, `cancellation_policy`, `hold_expires_at`, `payment_id`, `refund{amount Amount, percent, status}`, `guest_name`, `guest_email`, `guest_phone`, `last_payment_failure`, `created_at`, `confirmed_at`, `cancelled_at`, `expired_at`. The three guest fields are `HotelEncryptedCharField(read_roles=[ADMIN], subject_attr="guest_id", mask_as=NAME/EMAIL/PHONE)` |
-| `BookingPaymentSerializer` | `method` HotelEnumField; exactly one of `card{card_number (write_only), expiry_month 1–12, expiry_year, cvv (write_only), holder_name}`, `upi{vpa}`, `wallet{provider HotelEnumField, phone}`, matching `method` |
+| `BookingPaymentSerializer` | subclasses payment's published `PaymentMethodRequestSerializer` (§9.6): `method` HotelEnumField; exactly one of `card{card_number (write_only), expiry_month 1–12, expiry_year, cvv (write_only), holder_name}`, `upi{vpa}`, `wallet{provider HotelEnumField, phone}`, matching `method` |
 | `PaymentSummarySerializer` | → `payment_id`, `status`, `instrument`, `failure_code`, `failure_message` |
 | `BookingCancelSerializer` | `reason` str ≤ 255 opt |
 | `PaymentSerializer` | → `payment_id`, `booking_id`, `amount` Amount, `refunded_amount` Amount, `status`, `method`, `instrument`, `failure_code`, `failure_message`, `gateway_txn_id` (ADMIN only) |
@@ -2098,7 +2136,7 @@ Error body: `{"status": 2105002, "message": "Cannot pay a booking that is CANCEL
 |---|---|---|---|
 | `hb:rl:v1:{scope}:{u:<user>\|ip:<ip>}` | ZSET of microsecond timestamps | window | `RedisSlidingWindowRateLimiter` |
 | `hb:idem:v1:{scope}:{user}:{key}` | `ENC_…` ciphertext of `{"state", "fingerprint", "http_status", "body"}` | 60 s in progress / 24 h done | `RedisIdempotencyStore` |
-| `hb:enc:v1:{sha256(X-Encrypted-Key)}` | `1` | 300 s | `ApiEncryptionMiddleware` (replay guard) |
+| `hb:enc:v1:{sha256(X-Encrypted-Key)}` | `1` | 660 s | `ApiEncryptionMiddleware` (replay guard) |
 
 ## 12. Database summary
 
@@ -2120,6 +2158,7 @@ Migrations: one initial migration per app, plus `catalog/migrations/0002_seed_am
 | `DJANGO_SECRET_KEY`, `DJANGO_DEBUG` | dev value, `false` | |
 | `API_VERSION` | `v1` | URL prefix |
 | `POSTGRES_NAME` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_HOST` / `POSTGRES_PORT` | `hotel` / `hotel` / `hotel` / `postgres` / `5432` | |
+| `DB_LOCK_TIMEOUT_MS` / `DB_STATEMENT_TIMEOUT_MS` | `2000` / `5000` | request-path `lock_timeout` / `statement_timeout`; 0 omits one (the entrypoint's `migrate` runs with both 0) |
 | `REDIS_URL` | `redis://redis:6379/0` | `fakeredis://` in tests |
 | `JWT_SIGNING_KEY` | dev base64 (32 bytes) | HS256 key |
 | `JWT_ISSUER` / `JWT_AUDIENCE` / `JWT_TTL_SECONDS` | `hotel-booking` / `hotel-booking-api` / `3600` | |
@@ -2132,10 +2171,13 @@ Migrations: one initial migration per app, plus `catalog/migrations/0002_seed_am
 | `TRUSTED_PROXY_COUNT` | `0` | |
 | `DEV_TOKENS_ALLOW_ADMIN` | `true` | local demo only |
 | `BOOKING_HOLD_TTL_SECONDS` / `INVENTORY_HORIZON_DAYS` / `MAX_STAY_NIGHTS` | `900` / `365` / `30` | |
+| `APP_PORT` | unset (8000) | compose only: host port of the API, set in an untracked `.env` |
+
+`scripts/bootstrap_env.py [--force] [--app-port N]` writes a fresh `.env` (mode 600) with a new `DJANGO_SECRET_KEY`, `JWT_SIGNING_KEY`, one-key `PII_ENCRYPTION_KEYS`/`PII_ACTIVE_KEY_ID`, `PII_BLIND_INDEX_KEY` and `IDEMPOTENCY_FINGERPRINT_KEY` (base64 of 32 random bytes each), and a new RSA-3072 PKCS#8 key at `secrets/local/api_rsa_private.pem` (`API_RSA_PRIVATE_KEY_PATH`). It refuses to overwrite either file without `--force`, and keeps an existing `APP_PORT`.
 
 `docker-compose.yml` services:
-- `postgres` (`postgres:18`, healthcheck) and `redis` (`redis:7-alpine`).
-- `app`: built from the Dockerfile on `python:3.13-slim`, with `env_file: [.env.example, {path: .env, required: false}]`. Its entrypoint runs `migrate && seed_demo && gunicorn hotel_booking_service.wsgi -b 0.0.0.0:8000 -w 3`. It is published on host port `${APP_PORT:-8000}`, so a machine where 8000 is taken sets `APP_PORT` in its untracked `.env`.
+- `postgres` (`postgres:18`, healthcheck) and `redis` (`redis:7-alpine`), published on `127.0.0.1:5432` and `127.0.0.1:6379` only.
+- `app`: built from the Dockerfile on `python:3.13-slim`, with `env_file: [.env.example, {path: .env, required: false}]` and `./secrets` (the dev key, and `secrets/local` from `bootstrap_env.py`) mounted read-only at `/app/secrets`. Its entrypoint runs `DB_LOCK_TIMEOUT_MS=0 DB_STATEMENT_TIMEOUT_MS=0 migrate`, then `seed_demo`, then `gunicorn hotel_booking_service.wsgi -b 0.0.0.0:8000 -w 3 --access-logfile - --access-logformat '%(h)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s %(M)sms request_id=%({x-request-id}o)s'`: the access log carries the path, never the query string or Referer, because it bypasses `PiiRedactionFilter`. It is published on `127.0.0.1:${APP_PORT:-8000}`, so a machine where 8000 is taken sets `APP_PORT` in its untracked `.env`.
 - `scheduler`: the same image, running `while true; do python manage.py expire_pending_bookings; python manage.py extend_inventory_horizon; sleep 60; done`.
 
 ## 14. Test plan
@@ -2154,7 +2196,10 @@ Unit tests run without a database, using in-memory repositories and fakes. DB an
 | Common fields + logs (db) | `tests/integration/test_common_fields_and_logs.py` | insert stamps creation_by; update stamps updation_*; one log row per save/update/bulk_create; request_id on logs; raw SQL shows `ENC_` ciphertext in live and log tables; `makemigrations --check` clean |
 | Catalog | `catalog/tests/test_property_domain.py` | onboard validation; type rules (villa, hotel rating); add_room_type re-checks rules; duplicate names; standalone and chain accounts share one path |
 | Inventory | `inventory/tests/test_inventory_service.py` | hold/confirm/release; idempotent release; horizon edges; missing rows auto-created |
-| Concurrency (db) | `tests/integration/test_inventory_concurrency.py` | `@pytest.mark.django_db(transaction=True)`; one room; 10 threads behind `threading.Barrier(10)` call `get_inventory_api().hold(...)`; each closes `django.db.connection` in `finally`; exactly 1 success and 9 `INVENTORY_UNAVAILABLE`; `reserved_rooms == 1`. Second test: overlapping stays (1–3 vs 2–4) race in both orders — no deadlock |
+| Concurrency (db) | `tests/integration/test_inventory_concurrency.py` | `@pytest.mark.django_db(transaction=True)`; one room; 10 threads behind `threading.Barrier(10)` call `get_inventory_api().hold(...)`; each closes `django.db.connection` in `finally`; exactly 1 success and 9 `INVENTORY_UNAVAILABLE`; `reserved_rooms == 1`. Overlapping stays sharing three nights (11–14 vs 12–15) race in both assignments over 20 rounds, and a hold races a release of the overlapping stay: never a deadlock or lock-timeout error. `lock_for_stay`'s SQL ends `ORDER BY … stay_date ASC FOR UPDATE` (deterministic guard: one fast statement rarely deadlocks in a race even when the order is wrong); negative control: night-by-night locking in opposite directions is reported as "deadlock detected" by the same harness |
+| Booking races (db) | `tests/integration/test_booking_concurrency.py` | `transaction=True` + `truncate_context_tables`; over HTTP, real threads: pay vs the expiry job (job clock past the hold, staggered start) → CONFIRMED with one SUCCEEDED payment, or EXPIRED (409 2105003) with none; double cancel → one 200, one 409 2105002, one refund row, counters back to 0; two pays with different keys → one 200, one 409 2105002, one payment; 10 POST /bookings for the last room → one 201, nine 409 2102001. Each booking race fails when `get_for_update` loses `FOR UPDATE` |
+| API edge cases (db) | `tests/integration/test_booking_edge_cases_api.py` | parametrized over HTTP, asserting HTTP status, envelope code and envelope shape (`data` null, `errors` naming the field): sold out 409 2102001; over capacity 422 2105008; check_out ≤ check_in, > 30 nights, missing contact 400 2100001; past / beyond horizon 400 2105005; no token 401; pay CONFIRMED / CANCELLED and double cancel 409 2105002; pay key reused with another body 422 2100011; Luhn 400 2106002; cancel after check-in 422 2105007; pay PAY_AT_PROPERTY 422 2105009; another guest's booking 404 |
+| OpenAPI contract (db) | `tests/contract/test_openapi_schema.py` | schema generated with no drf-spectacular warnings or errors and passes `validate_schema`; `/schema` serves it; create/pay/cancel and catalog writes declare `Idempotency-Key` (required on pay); every response of a booking journey (200/201/400/401/402/404/409/422) validates with jsonschema against its documented schema, `nullable` read as type-or-null; negative control for the checker |
 | Pricing | `pricing/tests/test_strategies.py` | weekend nights; occupancy tiers; totals × rooms; registry completeness |
 | Discovery | `discovery/tests/test_search_service.py` | each filter; unavailable excluded; price filter; sort orders; paging; registering a new filter needs no service change |
 | Booking state machine | `booking/tests/test_state_machine.py` | every allowed transition; every invalid pair → 409 |
@@ -2162,7 +2207,8 @@ Unit tests run without a database, using in-memory repositories and fakes. DB an
 | Booking services | `booking/tests/test_booking_services.py` | create → pay → confirmed; declined stays pending (402 outcome); `now == hold_expires_at` counts as expired; pay after job-expired → EXPIRED; durable replay without Redis; cancel with refund; refund failure rolls back; pay-at-property; expiry job per booking |
 | Payment | `payment/tests/test_payment_methods.py`, `test_charge_service.py` | Luhn, brands, VPA, wallet; duplicate key → same payment; refund limits; repr has no card data |
 | API end-to-end (db) | `tests/integration/test_booking_flow_api.py` | onboard → search → book → pay → cancel → search shows the room again; book → expire job → room bookable again |
-| Architecture (optional) | `tests/architecture/test_module_boundaries.py` | cross-app imports only via `public`; no Django in `domain/`; app graph acyclic |
+| Architecture | `tests/architecture/test_module_boundaries.py` | AST walk over every import (function-level and `TYPE_CHECKING` included, `tests/` excluded): cross-app imports only via `<app>.public` (migrations too); `hotel_commons` imports no app; no Django/DRF/drf-spectacular in any `domain/` or `interfaces/`; `services/` import no other app; app graph acyclic and equal to the HLD §3.4 map; negative controls on synthetic sources |
+| Container config | `tests/infra/` | gunicorn access-log format renders no query string or Referer (rendered through gunicorn's own logger); `migrate` alone runs with `DB_*_TIMEOUT_MS=0`, and settings drop the timeouts only then; every compose port bound to `127.0.0.1`; `bootstrap_env.py` keys pass `validate_security_settings` as production, differ per run, RSA-3072, refuses to overwrite without `--force`; no literal card expiry year in root tests or the README |
 
 ## 15. Build order and file ownership
 
@@ -2177,13 +2223,13 @@ Unit tests run without a database, using in-memory repositories and fakes. DB an
 
 Rules:
 - The core flows must pass end-to-end with `API_ENCRYPTION_MODE=off` before polishing anything.
-- DynamicPricing, the architecture test and `scripts/encrypted_request.py` are built last.
+- DynamicPricing, the architecture test, `scripts/encrypted_request.py` and `scripts/bootstrap_env.py` are built last.
 
 ## 16. README contents
 
 1. **Stack note.** Python/Django + DRF was agreed with Rupeek in place of Java/Spring Boot. Include a concept map: Spring interface → ABC in `interfaces/`; `@Service` → `services/`; JPA repository → `repositories/`; `@RestController` → DRF viewset; Spring profile → `ENVIRONMENT`.
-2. **Quick start.** `docker compose up --build`, a token from `POST /hotel/v1/dev/tokens` or `manage.py mint_token`, Swagger at `/hotel/v1/docs`, and a curl walkthrough: onboard → search → book → pay → cancel → search again.
-3. **Running tests.** `pytest` for unit tests; `pytest -m integration` with compose running.
+2. **Quick start.** `docker compose up --build`, the host port (`APP_PORT`, default 8000; loopback only), a token from `POST /hotel/v1/dev/tokens` or `manage.py mint_token`, Swagger at `/hotel/v1/docs`, and a curl walkthrough, verified against a running stack: onboard → search → book (durable Idempotency-Key) → pay → cancel → search again, plus the search date rules, 409/503 busy and timeout answers, and OPTIONS.
+3. **Running tests.** `pytest` for unit tests; `pytest -m integration` with compose running; the architecture, contract and container-config suites.
 4. **Assumptions:** A1–A9 from the HLD.
 5. **Key design decisions.** The requirement map, modular monolith + hexagonal apps, concurrency strategy, state machines, log-model strategy, PII encryption.
 6. **Beyond the brief.** The security features were requested extras. Each is toggleable: `API_ENCRYPTION_MODE=off`, `RATE_LIMIT_ENABLED=false`. Brief §8 lists auth as out of scope; it is minimal here (signed dev tokens).

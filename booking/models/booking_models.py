@@ -3,7 +3,9 @@
 Money is BIGINT paisa, enums SMALLINT, guest contact details AES-GCM ciphertext with masked companions for
 owner views. Ids of other contexts (property, room type, owner account, hold, payment) are plain UUIDs: no
 cross-schema foreign keys, so the schema can move to its own database unchanged. CHECK constraints repeat
-the domain's invariants, so they hold even if application code is wrong.
+the domain's invariants, so they hold even if application code is wrong. The client's Idempotency-Key is
+kept per guest under a partial unique constraint, so a retried create returns the first booking even when
+Redis has forgotten the key.
 """
 
 from typing import Final
@@ -19,11 +21,12 @@ from hotel_commons.models.managers import CustomUpdateManager
 from hotel_commons.security.pi_type import PiType
 from uuid6 import uuid7
 
-from booking.constants import TEXT_MAX_LENGTH, USER_ID_MAX_LENGTH
+from booking.constants import IDEMPOTENCY_KEY_MAX_LENGTH, TEXT_MAX_LENGTH, USER_ID_MAX_LENGTH
 from booking.enums import BookingRefundStatus, BookingStatus, BookingType
 from catalog.public.enums import CancellationPolicyCode, PricingStrategyCode
 
 _MASK_MAX_LENGTH: Final = 255
+BOOKING_IDEMPOTENCY_KEY_CONSTRAINT: Final = "booking_guest_idempotency_key_uniq"
 
 
 class CommonBooking(AddCommonField):
@@ -64,6 +67,12 @@ class CommonBooking(AddCommonField):
     confirmed_at = models.DateTimeField(null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
     expired_at = models.DateTimeField(null=True, blank=True)
+    idempotency_key = models.CharField(
+        max_length=IDEMPOTENCY_KEY_MAX_LENGTH,
+        null=True,
+        blank=True,
+        db_comment="The client's Idempotency-Key of the create request, unique per guest",
+    )
 
     class Meta:
         abstract = True
@@ -76,7 +85,8 @@ class Booking(CommonBooking):
         db_table = schema_table("booking", "booking")
         indexes = [
             models.Index(fields=["guest_id", "creation_date"], name="booking_guest_created_idx"),
-            models.Index(fields=["property_id"], name="booking_property_idx"),
+            # list_for_property's order: a page is an index range scan, no sort of the property's bookings.
+            models.Index(fields=["property_id", "-creation_date", "-id"], name="booking_property_created_idx"),
             # The expiry job's scan: only pending bookings have a live hold to expire.
             models.Index(
                 fields=["hold_expires_at"],
@@ -85,6 +95,11 @@ class Booking(CommonBooking):
             ),
         ]
         constraints = [
+            models.UniqueConstraint(
+                fields=["guest_id", "idempotency_key"],
+                condition=Q(idempotency_key__isnull=False),
+                name=BOOKING_IDEMPOTENCY_KEY_CONSTRAINT,
+            ),
             models.CheckConstraint(condition=Q(check_out__gt=F("check_in")), name="booking_dates_valid"),
             models.CheckConstraint(condition=Q(rooms__gte=1), name="booking_rooms_positive"),
             models.CheckConstraint(condition=Q(guests__gte=1), name="booking_guests_positive"),

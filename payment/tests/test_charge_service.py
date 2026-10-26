@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 from hotel_commons.domain.money import Money
 from hotel_commons.exceptions import BusinessRuleViolation, UpstreamFailure
+from hotel_commons.status_code import IDEMPOTENCY_KEY_REUSED
 from hotel_commons.testing.clock import FixedClock
 from hotel_commons.testing.unit_of_work import NoopUnitOfWork
 
@@ -21,7 +22,13 @@ from payment.public.dto import ChargeCommand, RefundCommand
 from payment.services.charge_service import ChargeService
 from payment.services.refund_service import RefundService
 from payment.status_code import PAYMENT_NOT_REFUNDABLE, REFUND_EXCEEDS_PAYMENT, REFUND_FAILED
-from payment.tests.fakes import CountingGateway, InMemoryPaymentRepository, InMemoryRefundRepository, method_registry
+from payment.tests.fakes import (
+    CountingGateway,
+    InMemoryPaymentRepository,
+    InMemoryRefundRepository,
+    fingerprinter,
+    method_registry,
+)
 
 NOW = datetime(2026, 1, 5, 6, 30, tzinfo=UTC)
 BOOKING_ID = UUID("0192f5c5-0000-7000-8000-000000000001")
@@ -35,7 +42,9 @@ class Harness:
         self.refunds = InMemoryRefundRepository()
         self.gateway = CountingGateway()
         self.uow = NoopUnitOfWork()
-        self.charges = ChargeService(self.payments, method_registry(FixedClock(NOW)), self.gateway, self.uow)
+        self.charges = ChargeService(
+            self.payments, method_registry(FixedClock(NOW)), self.gateway, self.uow, fingerprinter()
+        )
         self.refund_service = RefundService(self.payments, self.refunds, self.gateway, self.uow)
 
     def charge(self, *, key: str = "pay:booking-1:attempt-1", rupees: str = "9600.00",
@@ -123,6 +132,68 @@ def test_duplicate_insert_race_returns_the_winning_payment(harness: Harness) -> 
     assert harness.charge(key="pay:booking-1:race") == winner
     assert harness.gateway.charge_calls == 0
     assert harness.uow.rollbacks == 1
+
+
+def test_same_key_with_other_method_is_reused_not_replayed(harness: Harness) -> None:
+    declined = harness.charge(key="pay:booking-1:k1", details={**CARD, "card_number": "4000000000000002"})
+    assert declined.status is PaymentStatus.FAILED
+
+    with pytest.raises(BusinessRuleViolation) as error:
+        harness.charge(key="pay:booking-1:k1", method="UPI", details={"vpa": "rahul@okaxis"})
+
+    assert error.value.status_code is IDEMPOTENCY_KEY_REUSED
+    assert harness.gateway.charge_calls == 1
+    assert len(harness.payments.rows) == 1
+
+
+def test_same_key_with_other_card_details_is_reused(harness: Harness) -> None:
+    harness.charge(key="pay:booking-1:k1")
+    with pytest.raises(BusinessRuleViolation) as error:
+        harness.charge(key="pay:booking-1:k1", details={**CARD, "cvv": "123"})
+    assert error.value.status_code is IDEMPOTENCY_KEY_REUSED
+
+
+def test_same_request_in_another_key_order_is_a_replay(harness: Harness) -> None:
+    first = harness.charge(key="pay:booking-1:k1")
+    assert harness.charge(key="pay:booking-1:k1", details=dict(reversed(CARD.items()))) == first
+    assert harness.gateway.charge_calls == 1
+
+
+def test_find_by_idempotency_key_compares_the_request_when_given(harness: Harness) -> None:
+    payment = harness.charge(key="pay:booking-1:k1")
+    find = harness.charges.find_by_idempotency_key
+
+    assert find("pay:booking-1:k1") == payment
+    assert find("pay:booking-1:k1", method="CARD", method_details=CARD) == payment
+    assert find("pay:booking-1:unused", method="UPI", method_details={"vpa": "rahul@okaxis"}) is None
+    with pytest.raises(BusinessRuleViolation) as error:
+        find("pay:booking-1:k1", method="UPI", method_details={"vpa": "rahul@okaxis"})
+    assert error.value.status_code is IDEMPOTENCY_KEY_REUSED
+
+
+def test_payment_without_fingerprint_is_replayed_for_any_request(harness: Harness) -> None:
+    legacy = harness.charge(key="pay:booking-1:k1")
+    harness.payments.rows[legacy.id] = dataclasses.replace(legacy, request_fingerprint=None)
+
+    replay = harness.charge(key="pay:booking-1:k1", method="UPI", details={"vpa": "rahul@okaxis"})
+
+    assert replay.id == legacy.id
+    assert harness.gateway.charge_calls == 1
+
+
+def test_insert_race_lost_to_another_request_is_reused(harness: Harness) -> None:
+    harness.charge(key="pay:booking-1:race")
+    find = harness.payments.find_by_idempotency_key
+    lookups: list[str] = []
+
+    def find_missing_first(key: str) -> Payment | None:
+        lookups.append(key)
+        return None if len(lookups) == 1 else find(key)
+
+    harness.payments.find_by_idempotency_key = find_missing_first  # type: ignore[method-assign]
+    with pytest.raises(BusinessRuleViolation) as error:
+        harness.charge(key="pay:booking-1:race", method="UPI", details={"vpa": "rahul@okaxis"})
+    assert error.value.status_code is IDEMPOTENCY_KEY_REUSED
 
 
 def test_refund_cannot_exceed_payment(harness: Harness) -> None:

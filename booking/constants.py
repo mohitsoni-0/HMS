@@ -8,9 +8,12 @@ GUEST_NAME_MIN_LENGTH: Final = 2
 GUEST_NAME_MAX_LENGTH: Final = 100
 TEXT_MAX_LENGTH: Final = 255  # cancellation reason, last payment failure
 USER_ID_MAX_LENGTH: Final = 64  # JWT ``sub``
+IDEMPOTENCY_KEY_MAX_LENGTH: Final = 128  # the Idempotency-Key header's longest form
 
 REFUND_REASON: Final = "booking cancelled"
 EXPIRE_BATCH_SIZE: Final = 100
+EXPIRE_TIME_BUDGET_SECONDS: Final = 45  # one run stays well inside the scheduler's 60 s interval
+OWNER_ACCOUNT_RESOURCE: Final = "owner_account"  # catalog's IDOR resource: active accounts only
 
 BOOKING_RESOURCE: Final = "booking"  # IDOR resource name
 PROPERTY_RESOURCE: Final = "property"

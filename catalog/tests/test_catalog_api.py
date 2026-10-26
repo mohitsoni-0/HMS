@@ -2,11 +2,12 @@
 
 from datetime import timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from django.core.management import call_command
-from django.db import connection
+from django.db import connection, transaction
+from hotel_commons.exceptions import Conflict
 from hotel_commons.domain.clock import SystemClock
 from hotel_commons.domain.date_range import DateRange
 from hotel_commons.security.principal import Principal, Role
@@ -14,7 +15,10 @@ from hotel_commons.status_code import NOT_FOUND, VALIDATION_FAILED
 from hotel_commons.testing.unit_of_work import NoopUnitOfWork
 from inventory.public.api import get_inventory_api
 
+from catalog.domain.property import Property as DomainProperty
+from catalog.domain.room_type import RoomType
 from catalog.models.catalog_models import Property
+from catalog.repositories.property_repository import DjangoPropertyRepository
 from catalog.serializers.owner_account_serializers import OwnerAccountSerializer
 from catalog.services.owner_account_service import OwnerAccountService
 from catalog.status_code import (
@@ -24,7 +28,14 @@ from catalog.status_code import (
     PROPERTY_TYPE_RULE_VIOLATED,
     UNKNOWN_AMENITIES,
 )
-from catalog.tests.fakes import InMemoryOwnerAccountRepository, owner_draft
+from catalog.tests.fakes import (
+    KNOWN_AMENITIES,
+    InMemoryOwnerAccountRepository,
+    owner_draft,
+    property_draft,
+    room_type_draft,
+)
+from catalog.tests.openapi_contract import assert_matches_schema
 
 pytestmark = pytest.mark.django_db
 
@@ -149,7 +160,11 @@ def test_second_account_with_same_email_conflicts(api_client, auth, open_account
     response = api_client.post(f"{API}/owner-accounts", payload, **auth("owner-2", "OWNER"))
 
     assert response.status_code == 409
-    assert response.json()["status"] == OWNER_ACCOUNT_EXISTS.code
+    body = response.json()
+    assert body["status"] == OWNER_ACCOUNT_EXISTS.code
+    assert body["message"] == "Owner account could not be created with these contact details"
+    assert "email" not in body["message"].lower() and "exists" not in body["message"].lower()
+    assert body["data"] is None
 
 
 def test_invalid_contact_phone_is_400(api_client, auth):
@@ -239,7 +254,7 @@ def test_invalid_base_price_is_400(open_account, onboard, base_price):
     response = onboard(account["account_id"], room_types=[room_type_payload(base_price=base_price)])
 
     assert response.status_code == 400
-    assert "room_types" in response.json()["errors"]
+    assert any(key.split(".")[0] == "room_types" for key in response.json()["errors"])  # e.g. room_types.0.base_price
 
 
 def test_property_details_are_public(api_client, open_account, onboard):
@@ -270,6 +285,33 @@ def test_add_room_type_and_duplicate_name_conflicts(api_client, auth, open_accou
     assert added.json()["data"]["name"] == "Family Suite"
     assert duplicate.status_code == 409
     assert duplicate.json()["status"] == DUPLICATE_ROOM_TYPE_NAME.code
+
+
+def test_onboarding_api_maps_greek_final_sigma_duplicate_to_409(api_client, auth, open_account, onboard):
+    response = onboard(
+        open_account()["account_id"], room_types=[room_type_payload("ΟΔΟΣ Suite"), room_type_payload("οδοσ suite")]
+    )
+
+    assert response.status_code == 409
+    assert response.json()["status"] == DUPLICATE_ROOM_TYPE_NAME.code
+
+
+def test_repository_maps_a_duplicate_name_the_domain_missed_to_409(open_account):
+    """The unique constraint is the source of truth: onboarding (``add``) maps its violation like ``add_room_type``."""
+    account_id = open_account()["account_id"]
+    property_ = DomainProperty.onboard(
+        owner_account_id=UUID(account_id),
+        draft=property_draft(room_types=(room_type_draft("Deluxe"),)),
+        known_amenities=KNOWN_AMENITIES,
+        rules=(),
+    )
+    property_.room_types.append(RoomType.create(property_id=property_.id, draft=room_type_draft("DELUXE")))
+
+    with pytest.raises(Conflict) as error, transaction.atomic():
+        DjangoPropertyRepository().add(property_)
+
+    assert error.value.status_code == DUPLICATE_ROOM_TYPE_NAME
+    assert not Property.objects.filter(pk=property_.id).exists()
 
 
 def test_villa_rejects_a_second_room_type(api_client, auth, open_account, onboard):
@@ -304,3 +346,29 @@ def test_seed_demo_is_idempotent():
 
     assert Property.objects.count() == 3
     assert set(Property.objects.values_list("city_key", flat=True)) == {"goa", "bengaluru"}
+
+
+def test_catalog_responses_match_the_published_schema(api_client, auth, open_account, onboard):
+    """A2/A3: list endpoints document one envelope object, and nullable fields are documented as nullable."""
+    owner = auth("owner-1", "OWNER")
+    amenities = api_client.get(f"{API}/amenities")
+    created = api_client.post(f"{API}/owner-accounts", account_payload("contract@example.com"), **owner)
+    account_id = created.json()["data"]["account_id"]
+    onboarded = onboard(account_id, star_rating=None, property_type="HOMESTAY")
+    property_id = onboarded.json()["data"]["property_id"]
+    listed = api_client.get(f"{API}/owner-accounts/{account_id}/properties", **owner)
+    retrieved = api_client.get(f"{API}/properties/{property_id}")
+    room_type = api_client.post(f"{API}/properties/{property_id}/room-types", room_type_payload("Annex"), **owner)
+    duplicate = api_client.post(f"{API}/owner-accounts", account_payload("contract@example.com"), **owner)
+
+    assert [r.status_code for r in (amenities, created, onboarded, listed, retrieved, room_type, duplicate)] == [
+        200, 201, 201, 200, 200, 201, 409
+    ]
+    assert retrieved.json()["data"]["star_rating"] is None
+    assert_matches_schema(amenities, "/hotel/v1/catalog/amenities", "get")
+    assert_matches_schema(created, "/hotel/v1/catalog/owner-accounts", "post")
+    assert_matches_schema(duplicate, "/hotel/v1/catalog/owner-accounts", "post")
+    assert_matches_schema(onboarded, "/hotel/v1/catalog/owner-accounts/{account_id}/properties", "post")
+    assert_matches_schema(listed, "/hotel/v1/catalog/owner-accounts/{account_id}/properties", "get")
+    assert_matches_schema(retrieved, "/hotel/v1/catalog/properties/{property_id}", "get")
+    assert_matches_schema(room_type, "/hotel/v1/catalog/properties/{property_id}/room-types", "post")

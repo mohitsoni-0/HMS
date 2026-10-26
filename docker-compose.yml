@@ -9,8 +9,10 @@ x-app: &app
     - path: .env
       required: false
   volumes:
-    # DEV-ONLY RSA key for API payload encryption: mounted read-only, never baked into the image.
-    - ./secrets/dev:/app/secrets/dev:ro
+    # RSA keys for API payload encryption, mounted read-only and never baked into the image: the DEV-ONLY
+    # secrets/dev key, and secrets/local once scripts/bootstrap_env.py has written one (git-ignored). The whole
+    # folder is mounted, so no host directory has to exist beforehand.
+    - ./secrets:/app/secrets:ro
   depends_on:
     postgres:
       condition: service_healthy
@@ -25,7 +27,8 @@ services:
       POSTGRES_USER: hotel
       POSTGRES_PASSWORD: hotel
     ports:
-      - "5432:5432"
+      # Published on the loopback interface only: the dev password and an auth-less Redis must not reach the LAN.
+      - "127.0.0.1:5432:5432"
     volumes:
       # PostgreSQL 18 images keep their data under /var/lib/postgresql/<major>/docker.
       - pgdata:/var/lib/postgresql
@@ -39,7 +42,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -53,7 +56,8 @@ services:
     pull_policy: build
     ports:
       # Host port 8000, unless APP_PORT says otherwise (e.g. in an untracked .env when 8000 is taken locally).
-      - "${APP_PORT:-8000}:8000"
+      # Loopback only: with DEV_TOKENS_ALLOW_ADMIN=true anyone who can reach the port can mint an ADMIN token.
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
     healthcheck:
       # Healthy once migrations and demo data are in and gunicorn answers. The scheduler waits for this.
       test:

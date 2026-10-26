@@ -11,7 +11,8 @@ from uuid import UUID, uuid4
 import pytest
 from django.conf import settings
 from django.core.management import call_command
-from django.db import transaction
+from django.db import connection, transaction
+from django.test.utils import CaptureQueriesContext
 
 from hotel_commons.domain.clock import SystemClock
 from hotel_commons.domain.date_range import DateRange
@@ -135,9 +136,32 @@ def test_occupancy_is_reserved_share() -> None:
     room_type_id = _provisioned(4, stay)
     repository.add_reserved(room_type_id, _stay(1, 1), 3)
 
-    occupancy = repository.occupancy(room_type_id, stay.dates())
+    occupancy = repository.occupancy_many([room_type_id], stay.dates())
 
-    assert occupancy == {stay.start: Decimal("0.75"), stay.start + timedelta(days=1): Decimal(0)}
+    assert occupancy == {room_type_id: {stay.start: Decimal("0.75"), stay.start + timedelta(days=1): Decimal(0)}}
+
+
+def test_occupancy_many_reads_every_room_type_in_one_query() -> None:
+    repository = DjangoRoomNightRepository()
+    stay = _stay(1, 2)
+    room_type_ids = [_provisioned(2, stay) for _ in range(5)]
+    repository.add_reserved(room_type_ids[0], stay, 1)
+
+    with CaptureQueriesContext(connection) as queries:
+        occupancy = repository.occupancy_many([*room_type_ids, uuid4()], stay.dates())
+
+    assert len(queries) == 1
+    assert set(occupancy) == set(room_type_ids)
+    assert occupancy[room_type_ids[0]] == dict.fromkeys(stay.dates(), Decimal("0.5"))
+    assert occupancy[room_type_ids[4]] == dict.fromkeys(stay.dates(), Decimal(0))
+
+
+def test_api_booking_window_matches_the_configured_horizon() -> None:
+    today = SystemClock().today()
+
+    window = get_inventory_api().booking_window()
+
+    assert window == DateRange(today, today + timedelta(days=settings.INVENTORY_HORIZON_DAYS))
 
 
 def test_hold_round_trip_writes_log_rows() -> None:

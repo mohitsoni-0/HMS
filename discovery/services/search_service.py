@@ -1,26 +1,36 @@
 """Property search (LLD §7.2, HLD §6.2).
 
-1. INDEX filters become predicates and select candidate listings from the read model.
-2. Live availability for the stay drops room types without enough free rooms.
-3. The remaining room types are quoted for the stay.
-4. OFFER filters run on the priced offers, which are grouped by property, sorted and paged.
+0. A stay outside inventory's booking window (first night before today, check-out past the horizon) is
+   refused with VALIDATION_FAILED: nothing outside it can be booked.
+1. INDEX filters become predicates and select candidate listings from the read model, ``batch_size`` at a
+   time (keyset paging), so every candidate of the city is considered and none is silently dropped.
+2. For each batch, live availability for the stay drops room types without enough free rooms.
+3. The remaining room types of the batch are quoted for the stay, and OFFER filters run on the priced offers.
+4. The offers of all batches are grouped by property, sorted and paged, so totals and order are exact.
 
 The service knows no individual filter or sorter: both come from registries, so adding one is a new class.
 Read-only, so there is no unit of work.
 """
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from uuid import UUID
 
 from discovery.domain.criteria import SearchCriteria, SortOrder
-from discovery.domain.filters import FilterRegistry, FilterStage, filter_registry
+from discovery.domain.filters import FilterRegistry, FilterStage, Predicate, filter_registry
 from discovery.domain.listing import Listing
 from discovery.domain.offers import PropertyResult, RoomOffer, SearchPage, group_by_property
 from discovery.domain.sorting import SORTERS, ResultSorter
 from discovery.interfaces.ports import AvailabilityPort, QuotePort
 from discovery.interfaces.repositories import ListingRepository
+from hotel_commons.domain.date_range import DateRange
+from hotel_commons.exceptions import ValidationFailed
+from hotel_commons.status_code import VALIDATION_FAILED
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_BATCH_SIZE = 500  # candidate listings per availability query and pricing batch
+LARGE_SEARCH_CANDIDATES = 5000  # beyond this many candidates a search is logged as a WARNING
 
 
 class SearchService:
@@ -31,37 +41,61 @@ class SearchService:
         quotes: QuotePort,
         filters: FilterRegistry = filter_registry,
         sorters: Mapping[SortOrder, ResultSorter] = SORTERS,
-        max_candidates: int = 2000,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        large_search_candidates: int = LARGE_SEARCH_CANDIDATES,
     ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
         self._listings = listings
         self._availability = availability
         self._quotes = quotes
         self._filters = filters
         self._sorters = sorters
-        self._max_candidates = max_candidates
+        self._batch_size = batch_size
+        self._large_search_candidates = large_search_candidates
 
     def search(self, criteria: SearchCriteria) -> SearchPage:
-        candidates = self._candidates(criteria)
-        offers = self._matching_offers(self._priced_offers(candidates, criteria), criteria)
+        """The page of ``criteria``; ValidationFailed(VALIDATION_FAILED) for a stay outside the booking window."""
+        self._require_bookable(criteria.stay)
+        offers, candidates = self._offers(criteria)
         results = self._sorters[criteria.sort].sort(group_by_property(offers))
-        logger.debug(
-            "Search found %d candidates, %d offers, %d properties", len(candidates), len(offers), len(results)
-        )
+        if candidates > self._large_search_candidates:
+            logger.warning("Search read %d candidate listings in batches of %d", candidates, self._batch_size)
+        logger.debug("Search found %d candidates, %d offers, %d properties", candidates, len(offers), len(results))
         return _page(results, criteria)
 
-    def _candidates(self, criteria: SearchCriteria) -> list[Listing]:
+    def _require_bookable(self, stay: DateRange) -> None:
+        window = self._availability.booking_window()
+        errors: dict[str, list[str]] = {}
+        if stay.start < window.start:
+            errors["check_in"] = ["check_in cannot be in the past."]
+        if stay.end > window.end:
+            errors["check_out"] = [f"check_out can be at most {window.nights} days from today."]
+        if errors:
+            raise ValidationFailed(VALIDATION_FAILED, errors=errors)
+
+    def _offers(self, criteria: SearchCriteria) -> tuple[list[RoomOffer], int]:
+        """The matching offers of every candidate, and how many candidates there were."""
         index_filters = self._filters.active(criteria, FilterStage.INDEX)
-        candidates = self._listings.find(
-            [search_filter.predicate(criteria) for search_filter in index_filters], limit=self._max_candidates
-        )
-        if len(candidates) >= self._max_candidates:
-            logger.warning("Search hit the candidate cap of %d listings; further matches were skipped",
-                           self._max_candidates)
-        return candidates
+        predicates = [search_filter.predicate(criteria) for search_filter in index_filters]
+        offers: list[RoomOffer] = []
+        candidates = 0
+        for batch in self._candidate_batches(predicates):
+            candidates += len(batch)
+            offers.extend(self._matching_offers(self._priced_offers(batch, criteria), criteria))
+        return offers, candidates
+
+    def _candidate_batches(self, predicates: Sequence[Predicate]) -> Iterator[list[Listing]]:
+        after: tuple[UUID, UUID] | None = None
+        while True:
+            batch = self._listings.find(predicates, limit=self._batch_size, after=after)
+            if batch:
+                yield batch
+            if len(batch) < self._batch_size:
+                return
+            after = (batch[-1].property_id, batch[-1].room_type_id)
 
     def _priced_offers(self, candidates: Sequence[Listing], criteria: SearchCriteria) -> list[RoomOffer]:
-        if not candidates:
-            return []
         free_rooms = self._availability.available_rooms(
             [listing.room_type_id for listing in candidates], criteria.stay, criteria.rooms
         )

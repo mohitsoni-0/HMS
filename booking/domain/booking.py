@@ -68,6 +68,7 @@ class Booking:
     confirmed_at: datetime | None = None
     cancelled_at: datetime | None = None
     expired_at: datetime | None = None
+    idempotency_key: str | None = None  # the client's key for the create request, unique per guest
 
     @staticmethod
     def validate_request(
@@ -104,6 +105,7 @@ class Booking:
         contact: GuestContact,
         price: BookingPrice,
         now: datetime,
+        idempotency_key: str | None = None,
     ) -> "Booking":
         """A new booking in the type's initial status, with the room type's terms snapshotted."""
         status = type_policy.initial_status
@@ -124,6 +126,7 @@ class Booking:
             contact=contact,
             created_at=now,
             confirmed_at=now if status is BookingStatus.CONFIRMED else None,
+            idempotency_key=idempotency_key,
         )
 
     def attach_hold(self, hold_id: UUID, expires_at: datetime | None) -> None:

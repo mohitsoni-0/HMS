@@ -62,11 +62,23 @@ TEMPLATES = [
 
 # --- Data stores -------------------------------------------------------------------------------------------
 
+# A contended booking fails fast (409 RESOURCE_BUSY / 503 SERVICE_TIMEOUT) instead of queueing behind a lock.
+# 0 leaves a limit unset: docker/entrypoint.sh runs ``migrate`` that way, so a long CREATE INDEX or a lock
+# wait behind live traffic does not abort the deploy.
+DB_LOCK_TIMEOUT_MS = _env.read_int("DB_LOCK_TIMEOUT_MS", 2000, minimum=0)
+DB_STATEMENT_TIMEOUT_MS = _env.read_int("DB_STATEMENT_TIMEOUT_MS", 5000, minimum=0)
+_DB_SESSION_OPTIONS = " ".join(
+    f"-c {name}={milliseconds}"
+    for name, milliseconds in (("lock_timeout", DB_LOCK_TIMEOUT_MS), ("statement_timeout", DB_STATEMENT_TIMEOUT_MS))
+    if milliseconds
+)
+
 # One database for every bounded context, one schema each, all through this single alias, so cross-context
-# use cases stay one ACID transaction (LLD §3.15).
+# use cases stay one ACID transaction (LLD §3.15). The backend is Django's PostgreSQL one with introspection
+# that resolves the schema-qualified ``db_table`` names, so migrations can alter their indexes and keys.
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.postgresql",
+        "ENGINE": "hotel_commons.db.backends.postgresql",
         "NAME": _env.read_str("POSTGRES_NAME", "hotel"),
         "USER": _env.read_str("POSTGRES_USER", "hotel"),
         "PASSWORD": _env.read_str("POSTGRES_PASSWORD"),
@@ -76,8 +88,7 @@ DATABASES = {
         "ATOMIC_REQUESTS": False,
         "CONN_MAX_AGE": 60,
         "CONN_HEALTH_CHECKS": True,
-        # A contended booking fails fast (409/503) instead of queueing behind a lock.
-        "OPTIONS": {"options": "-c lock_timeout=2000 -c statement_timeout=5000"},
+        "OPTIONS": {"options": _DB_SESSION_OPTIONS} if _DB_SESSION_OPTIONS else {},
     },
 }
 
@@ -92,6 +103,8 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ["hotel_commons.security.permissions.IsAuthenticatedPrincipal"],
     "DEFAULT_THROTTLE_CLASSES": ["hotel_commons.api.throttling.RedisRateLimitThrottle"],
     "EXCEPTION_HANDLER": "hotel_commons.api.exception_handler.envelope_exception_handler",
+    # OPTIONS answers 405 rather than DRF metadata (which fails on viewsets without a serializer_class).
+    "DEFAULT_METADATA_CLASS": None,
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "UNAUTHENTICATED_USER": None,
     "TEST_REQUEST_DEFAULT_FORMAT": "json",  # the API parses JSON only, so test clients must send JSON

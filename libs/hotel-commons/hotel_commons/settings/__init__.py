@@ -8,12 +8,15 @@ test settings included, has finished, so it judges the values the process will r
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Final, TypeVar
 
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
 from django.core.exceptions import ImproperlyConfigured
 
 from hotel_commons.consts import API_ENCRYPTION_OFF, ENVIRONMENT_LOCAL, ENVIRONMENT_PRODUCTION
@@ -21,9 +24,13 @@ from hotel_commons.consts import API_ENCRYPTION_OFF, ENVIRONMENT_LOCAL, ENVIRONM
 T = TypeVar("T")
 
 MIN_JWT_KEY_BYTES: Final = 32
+MIN_HMAC_KEY_BYTES: Final = 32
 PII_KEY_BYTES: Final = 32
 DEV_ENV_FILE: Final = ".env.example"
 DEV_SECRETS_DIR: Final = Path("secrets", "dev")
+# SHA-256 of the DER SubjectPublicKeyInfo of the committed secrets/dev/api_rsa_private.pem. Embedded rather than
+# read from disk because images ship without secrets/ (.dockerignore); update it if that dev key is regenerated.
+DEV_RSA_PUBLIC_KEY_SHA256: Final = frozenset({"0e6f703204d0bf9bc047a6e59770b7477d2b41a715a2f3c3259e08eecbb1c4e0"})
 
 _TRUE: Final = frozenset({"1", "true", "yes", "on"})
 _FALSE: Final = frozenset({"0", "false", "no", "off"})
@@ -168,9 +175,10 @@ def validate_security_settings(config: Any) -> None:
 
     ``config`` is ``django.conf.settings`` (any object with the setting attributes). Refused: a missing or
     sub-32-byte JWT_SIGNING_KEY; a PII key that is not 32 bytes; a PII_ACTIVE_KEY_ID outside the key ring;
-    a missing PII_BLIND_INDEX_KEY or IDEMPOTENCY_FINGERPRINT_KEY; and, unless ENVIRONMENT is "local", any
-    committed dev key: a value from BASE_DIR/.env.example, or the RSA key under BASE_DIR/secrets/dev (even
-    copied elsewhere) while API payload encryption is on. Messages name settings, never key material.
+    a missing or sub-32-byte PII_BLIND_INDEX_KEY or IDEMPOTENCY_FINGERPRINT_KEY; and, unless ENVIRONMENT is
+    "local", any committed dev key: a value from BASE_DIR/.env.example, or, while API payload encryption is
+    on, the committed secrets/dev RSA key at API_RSA_PRIVATE_KEY_PATH, recognised by the embedded fingerprint
+    of its public key wherever the file lives. Messages name settings, never key material.
     """
     problems = [*_key_problems(config), *_dev_key_problems(config)]
     if problems:
@@ -196,6 +204,8 @@ def _key_problems(config: Any) -> list[str]:
         value = getattr(config, name, None)
         if not isinstance(value, bytes) or not value:
             problems.append(f"{name} is missing")
+        elif len(value) < MIN_HMAC_KEY_BYTES:
+            problems.append(f"{name} must be at least {MIN_HMAC_KEY_BYTES} bytes")
     return problems
 
 
@@ -266,12 +276,26 @@ def _decoded_or_nothing(decoder: Callable[[str], T], value: str | None) -> list[
 
 
 def _uses_dev_rsa_key(config: Any, base_dir: Path) -> bool:
+    """Whether encryption is on and API_RSA_PRIVATE_KEY_PATH holds the committed dev key (by public-key fingerprint).
+
+    A file that is missing or does not parse is not the dev key; the cipher reports it on first use.
+    """
     if getattr(config, "API_ENCRYPTION_MODE", API_ENCRYPTION_OFF) == API_ENCRYPTION_OFF:
         return False
     configured = getattr(config, "API_RSA_PRIVATE_KEY_PATH", "")
     key_file = resolve_path(str(configured), base_dir) if configured else None
-    dev_dir = base_dir / DEV_SECRETS_DIR
-    if key_file is None or not key_file.is_file() or not dev_dir.is_dir():
+    if key_file is None or not key_file.is_file():
         return False
-    key = key_file.read_bytes()
-    return any(key == dev_key.read_bytes() for dev_key in dev_dir.glob("*.pem"))
+    return public_key_sha256(key_file.read_bytes()) in DEV_RSA_PUBLIC_KEY_SHA256
+
+
+def public_key_sha256(private_key_pem: bytes) -> str | None:
+    """Hex SHA-256 of the DER SubjectPublicKeyInfo of an unencrypted PEM private key; None when it does not load."""
+    try:
+        private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        return None
+    spki = private_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return hashlib.sha256(spki).hexdigest()

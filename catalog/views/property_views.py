@@ -8,7 +8,7 @@ from uuid import UUID
 
 from drf_spectacular.utils import extend_schema
 from hotel_commons.api.response import api_response
-from hotel_commons.api.schema import ERROR_ENVELOPE, envelope
+from hotel_commons.api.schema import ERROR_ENVELOPE, envelope, envelope_list
 from hotel_commons.api.views import BaseViewSet
 from hotel_commons.idempotency.decorators import idempotent
 from hotel_commons.security.idor import IdorRule
@@ -55,7 +55,7 @@ class PropertyViewSet(BaseViewSet):
         operation_id="catalog_owner_account_properties_list",
         tags=["catalog"],
         responses={
-            200: envelope(PropertySerializer(many=True), "PropertyListEnvelope"),
+            200: envelope_list(PropertySerializer, "PropertyListEnvelope"),
             401: ERROR_ENVELOPE,
             403: ERROR_ENVELOPE,
             404: ERROR_ENVELOPE,

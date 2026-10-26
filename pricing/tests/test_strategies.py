@@ -33,9 +33,18 @@ class RecordingOccupancy(OccupancyPort):
         self.by_night = dict(by_night or {})
         self.calls: list[tuple[UUID, tuple[date, ...]]] = []
 
+        self.batch_calls: list[tuple[tuple[UUID, ...], tuple[date, ...]]] = []
+
     def occupancy(self, room_type_id: UUID, nights: Sequence[date]) -> Mapping[date, Decimal]:
         self.calls.append((room_type_id, tuple(nights)))
         return {night: self.by_night.get(night, Decimal(0)) for night in nights}
+
+    def occupancy_many(
+        self, room_type_ids: Sequence[UUID], nights: Sequence[date]
+    ) -> Mapping[UUID, Mapping[date, Decimal]]:
+        self.batch_calls.append((tuple(room_type_ids), tuple(nights)))
+        by_night = {night: self.by_night.get(night, Decimal(0)) for night in nights}
+        return {room_type_id: dict(by_night) for room_type_id in room_type_ids}
 
 
 def _request(
@@ -186,3 +195,40 @@ def test_quote_many_keys_quotes_by_room_type() -> None:
 
     assert quotes[first.room_type_id].total == Money(400000)
     assert quotes[second.room_type_id].total == Money(480000)
+
+
+def test_quote_many_reads_occupancy_once_for_every_dynamic_request() -> None:
+    occupancy = RecordingOccupancy({THURSDAY: Decimal("0.95"), FRIDAY: Decimal("0.75")})
+    service = PricingService(build_default_registry(), occupancy)
+    dynamic = [_request(PricingStrategyCode.DYNAMIC, THURSDAY, SATURDAY) for _ in range(3)]
+    standard = _request(PricingStrategyCode.STANDARD, THURSDAY, SATURDAY)
+
+    quotes = service.quote_many([*dynamic, standard])
+
+    assert occupancy.calls == []
+    assert occupancy.batch_calls == [(tuple(request.room_type_id for request in dynamic), (THURSDAY, FRIDAY))]
+    for request in [*dynamic, standard]:
+        assert quotes[request.room_type_id] == service.quote(request)
+
+
+def test_quote_many_without_dynamic_requests_reads_no_occupancy() -> None:
+    occupancy = RecordingOccupancy()
+    service = PricingService(build_default_registry(), occupancy)
+
+    service.quote_many([_request(PricingStrategyCode.WEEKEND, THURSDAY, MONDAY)])
+
+    assert (occupancy.calls, occupancy.batch_calls) == ([], [])
+
+
+def test_quote_many_rejects_an_unregistered_strategy_before_reading_occupancy() -> None:
+    registry = PricingStrategyRegistry()
+    registry.register(DynamicPricing())
+    occupancy = RecordingOccupancy()
+    service = PricingService(registry, occupancy)
+
+    requests = [_request(code, THURSDAY, FRIDAY) for code in (PricingStrategyCode.DYNAMIC, PricingStrategyCode.STANDARD)]
+
+    with pytest.raises(BusinessRuleViolation):
+        service.quote_many(requests)
+
+    assert occupancy.batch_calls == []

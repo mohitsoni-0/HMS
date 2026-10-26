@@ -34,6 +34,7 @@ def new_payment_row(payment: Payment) -> PaymentRow:
         instrument_display=payment.instrument.display,
         instrument_ref=payment.instrument.sensitive_ref,
         idempotency_key=payment.idempotency_key,
+        request_fingerprint=payment.request_fingerprint,
     )
     apply_payment(payment, row)
     return row
@@ -60,6 +61,7 @@ def payment_from_row(row: PaymentRow) -> Payment:
         gateway_txn_id=row.gateway_txn_id,
         failure_code=row.failure_code,
         failure_message=row.failure_message,
+        request_fingerprint=row.request_fingerprint,
     )
 
 

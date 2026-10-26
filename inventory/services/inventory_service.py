@@ -122,16 +122,30 @@ class InventoryService:
 
     def occupancy(self, room_type_id: UUID, dates: Sequence[date]) -> dict[date, Decimal]:
         """Night -> share of rooms reserved (0..1) for every requested night; a night without a row is 0."""
-        known = self._room_nights.occupancy(room_type_id, dates)
-        return {night: known.get(night, Decimal(0)) for night in dates}
+        return self.occupancy_many([room_type_id], dates)[room_type_id]
+
+    def occupancy_many(self, room_type_ids: Sequence[UUID], dates: Sequence[date]) -> dict[UUID, dict[date, Decimal]]:
+        """``occupancy`` for every requested room type in one query: each gets every requested night."""
+        known = self._room_nights.occupancy_many(room_type_ids, dates) if room_type_ids else {}
+        return {
+            room_type_id: {night: known.get(room_type_id, {}).get(night, Decimal(0)) for night in dates}
+            for room_type_id in room_type_ids
+        }
+
+    def booking_window(self) -> DateRange:
+        """The stays inventory sells: first night today or later, check-out at most ``today + horizon_days``.
+
+        ``hold`` refuses any stay outside it; search uses it to refuse such stays up front.
+        """
+        today = self._clock.today()
+        return DateRange(today, today + timedelta(days=self._horizon_days))
 
     def _provisioned_dates(self) -> tuple[date, ...]:
-        today = self._clock.today()
-        return DateRange(today, today + timedelta(days=self._horizon_days)).dates()
+        return self.booking_window().dates()
 
     def _require_within_horizon(self, stay: DateRange) -> None:
-        today = self._clock.today()
-        if stay.start < today or stay.end > today + timedelta(days=self._horizon_days):
+        window = self.booking_window()
+        if stay.start < window.start or stay.end > window.end:
             raise BusinessRuleViolation(STAY_OUTSIDE_HORIZON, days=self._horizon_days)
 
 

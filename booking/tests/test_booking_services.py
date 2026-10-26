@@ -12,12 +12,15 @@ import pytest
 from catalog.public.enums import CancellationPolicyCode, PricingStrategyCode
 from hotel_commons.domain.money import Money
 from hotel_commons.exceptions import BusinessRuleViolation, Conflict, UpstreamFailure, ValidationFailed
+from hotel_commons.status_code import IDEMPOTENCY_KEY_REUSED
 from hotel_commons.testing.clock import FixedClock
 from hotel_commons.testing.events import RecordingEventPublisher
 
-from booking.domain.booking_types import BookingTypeRegistry
+from booking.domain.booking import Booking
+from booking.domain.booking_types import BookingTypeRegistry, PayAtPropertyBookingPolicy, PrepaidBookingPolicy
 from booking.domain.cancellation import CancellationPolicyRegistry
 from booking.domain.value_objects import GuestContact, RoomTypeInfo
+from booking.interfaces.repositories import DuplicateIdempotencyKey
 from booking.enums import BookingRefundStatus, BookingStatus, BookingType
 from booking.public.events import BookingCancelled, BookingConfirmed, BookingCreated, BookingExpired
 from booking.services.cancel_booking import CancelBookingService
@@ -34,6 +37,7 @@ from booking.status_code import (
     INVALID_STATE_TRANSITION,
 )
 from booking.tests.fakes import (
+    HOLD_NOT_CONFIRMABLE,
     FakeCatalog,
     FakeInventory,
     FakePayments,
@@ -73,7 +77,7 @@ def room_type(**overrides: object) -> RoomTypeInfo:
 class World:
     """The booking services wired to fakes, sharing one clock, event recorder and unit of work."""
 
-    def __init__(self, *room_types: RoomTypeInfo) -> None:
+    def __init__(self, *room_types: RoomTypeInfo, booking_types: BookingTypeRegistry | None = None) -> None:
         self.clock = FixedClock(NOW)
         self.events = RecordingEventPublisher()
         self.bookings = InMemoryBookingRepository()
@@ -83,19 +87,20 @@ class World:
         self.payments = FakePayments()
         self.uow = SnapshotUnitOfWork(self.bookings, self.inventory, self.payments)
         self.settings = BookingSettings(hold_ttl=HOLD_TTL, max_nights=30, horizon_days=365)
+        self.booking_types = booking_types or BookingTypeRegistry()
         self.create_service = CreateBookingService(
             self.bookings,
             self.catalog,
             self.pricing,
             self.inventory,
-            BookingTypeRegistry(),
+            self.booking_types,
             self.events,
             self.uow,
             self.clock,
             self.settings,
         )
         self.pay_service = PayBookingService(
-            self.bookings, self.payments, self.inventory, self.events, self.uow, self.clock
+            self.bookings, self.payments, self.inventory, self.booking_types, self.events, self.uow, self.clock
         )
         self.cancel_service = CancelBookingService(
             self.bookings,
@@ -109,6 +114,9 @@ class World:
         self.expire_service = ExpireBookingsService(self.bookings, self.inventory, self.events, self.uow, self.clock)
 
     def create(self, room: RoomTypeInfo, **overrides: object):
+        return self.create_result(room, **overrides).booking
+
+    def create_result(self, room: RoomTypeInfo, **overrides: object):
         values = {
             "guest_id": GUEST,
             "room_type_id": room.room_type_id,
@@ -121,12 +129,14 @@ class World:
         }
         return self.create_service.execute(CreateBookingCommand(**{**values, **overrides}))
 
-    def pay(self, booking_id: UUID, key: str = "pay-attempt-0001", card: dict | None = None):
+    def pay(
+        self, booking_id: UUID, key: str = "pay-attempt-0001", card: dict | None = None, method: str = "CARD"
+    ):
         return self.pay_service.execute(
             PayBookingCommand(
                 booking_id=booking_id,
                 payer_id=GUEST,
-                method="CARD",
+                method=method,
                 method_details=card or GOOD_CARD,
                 idempotency_key=key,
             )
@@ -240,8 +250,21 @@ def test_pay_replays_prior_decline_as_declined(world: World, room: RoomTypeInfo)
     booking = world.create(room)
     world.pay(booking.id, key="pay-attempt-0001", card=DECLINED_CARD)
 
-    assert world.pay(booking.id, key="pay-attempt-0001").outcome == "DECLINED"
+    assert world.pay(booking.id, key="pay-attempt-0001", card=DECLINED_CARD).outcome == "DECLINED"
     assert len(world.payments.charge_requests) == 1
+
+
+def test_pay_key_reused_for_another_method_is_refused_without_redis(world: World, room: RoomTypeInfo) -> None:
+    booking = world.create(room)
+    world.pay(booking.id, key="pay-attempt-0001", card=DECLINED_CARD)
+
+    # Redis forgot the key; the client retries it with a UPI payment instead of the declined card.
+    with pytest.raises(BusinessRuleViolation) as raised:
+        world.pay(booking.id, key="pay-attempt-0001", method="UPI", card={"vpa": "rahul@okbank"})
+
+    assert raised.value.status_code is IDEMPOTENCY_KEY_REUSED
+    assert len(world.payments.charge_requests) == 1  # UPI was not charged under the card's key
+    assert world.bookings.get(booking.id).status is BookingStatus.PENDING_PAYMENT
 
 
 def test_pay_with_new_key_after_confirmation_conflicts(world: World, room: RoomTypeInfo) -> None:
@@ -456,14 +479,37 @@ def test_expire_job_handles_each_booking_separately(world: World, room: RoomType
     assert [event.booking_id for event in world.events.of_type(BookingExpired)] == [healthy.id]
 
 
-def test_expire_job_respects_batch_size(world: World, room: RoomTypeInfo) -> None:
+def test_expire_job_stops_after_its_time_budget(world: World, room: RoomTypeInfo) -> None:
     for _ in range(3):
         world.create(room)
     world.clock.advance(HOLD_TTL)
 
+    assert world.expire_service.execute(batch_size=2, time_budget=timedelta(0)) == 2  # one batch, then stop
+    assert world.expire_service.execute(batch_size=2, time_budget=timedelta(0)) == 1
+    assert world.expire_service.execute(batch_size=2, time_budget=timedelta(0)) == 0
+
+
+def test_expire_job_drains_the_backlog_in_one_run(world: World, room: RoomTypeInfo) -> None:
+    bookings = [world.create(room) for _ in range(5)]
+    world.clock.advance(HOLD_TTL)
+
+    assert world.expire_service.execute(batch_size=2) == 5  # batches of 2, 2 and a short 1
+
+    assert all(world.bookings.get(b.id).status is BookingStatus.EXPIRED for b in bookings)
+
+
+def test_expire_job_does_not_retry_failures_within_a_run(world: World, room: RoomTypeInfo) -> None:
+    failing = [world.create(room) for _ in range(2)]  # the oldest holds: first in every batch
+    world.clock.advance(timedelta(minutes=1))
+    healthy = [world.create(room) for _ in range(2)]
+    world.clock.advance(HOLD_TTL)
+    world.inventory.failing_releases.update(b.hold_id for b in failing)
+
     assert world.expire_service.execute(batch_size=2) == 2
-    assert world.expire_service.execute(batch_size=2) == 1
-    assert world.expire_service.execute(batch_size=2) == 0
+
+    assert all(world.bookings.get(b.id).status is BookingStatus.EXPIRED for b in healthy)
+    assert all(world.bookings.get(b.id).status is BookingStatus.PENDING_PAYMENT for b in failing)
+    assert world.uow.rollbacks == 2  # each failing booking was tried once
 
 
 def test_guest_contact_hides_pii_from_repr() -> None:
@@ -483,3 +529,127 @@ def test_guest_contact_hides_pii_from_repr() -> None:
 def test_guest_contact_is_validated(contact: dict[str, str]) -> None:
     with pytest.raises(ValidationFailed):
         GuestContact(**contact)
+
+
+def test_create_with_same_key_returns_the_first_booking(world: World, room: RoomTypeInfo) -> None:
+    first = world.create_result(room, idempotency_key="create-attempt-0001")
+
+    # Redis was down or forgot the key: the retry reaches the service again.
+    again = world.create_result(room, idempotency_key="create-attempt-0001")
+
+    assert (first.replayed, again.replayed) == (False, True)
+    assert again.booking.id == first.booking.id
+    assert len(world.inventory.placed) == 1  # one hold, not two
+    assert len(world.events.of_type(BookingCreated)) == 1
+    assert world.bookings.list_for_guest(GUEST, page=1, page_size=20)[1] == 1
+
+
+def test_create_key_reused_for_another_stay_is_refused(world: World, room: RoomTypeInfo) -> None:
+    world.create(room, idempotency_key="create-attempt-0001")
+
+    with pytest.raises(BusinessRuleViolation) as raised:
+        world.create(room, idempotency_key="create-attempt-0001", rooms=2)
+
+    assert raised.value.status_code is IDEMPOTENCY_KEY_REUSED
+    assert len(world.inventory.placed) == 1
+
+
+def test_create_keys_are_per_guest(world: World, room: RoomTypeInfo) -> None:
+    mine = world.create(room, idempotency_key="create-attempt-0001")
+    theirs = world.create(room, idempotency_key="create-attempt-0001", guest_id="guest-2")
+
+    assert theirs.id != mine.id
+
+
+def test_create_losing_the_insert_race_returns_the_winner(world: World, room: RoomTypeInfo) -> None:
+    winner = world.create(room, idempotency_key="create-attempt-0001")
+    real_lookup = world.bookings.find_by_idempotency_key
+    calls: list[tuple[str, str]] = []
+
+    def racing_lookup(guest_id: str, key: str) -> Booking | None:
+        calls.append((guest_id, key))
+        return None if len(calls) == 1 else real_lookup(guest_id, key)  # looked before the winner committed
+
+    world.bookings.find_by_idempotency_key = racing_lookup
+
+    result = world.create_result(room, idempotency_key="create-attempt-0001")
+
+    assert result.replayed is True
+    assert result.booking.id == winner.id
+    assert list(world.inventory.placed) == [winner.hold_id]  # the loser's hold was rolled back
+    assert world.uow.rollbacks == 1
+
+
+def test_create_losing_the_last_rooms_to_its_own_retry_returns_the_winner(world: World, room: RoomTypeInfo) -> None:
+    winner = world.create(room, idempotency_key="create-attempt-0001")
+    real_lookup = world.bookings.find_by_idempotency_key
+    calls: list[tuple[str, str]] = []
+
+    def racing_lookup(guest_id: str, key: str) -> Booking | None:
+        calls.append((guest_id, key))
+        return None if len(calls) == 1 else real_lookup(guest_id, key)
+
+    def sold_out(**kwargs: object) -> UUID:
+        raise Conflict(HOLD_NOT_CONFIRMABLE, state="SOLD_OUT")  # the winner took the last rooms
+
+    world.bookings.find_by_idempotency_key = racing_lookup
+    world.inventory.hold = sold_out
+
+    result = world.create_result(room, idempotency_key="create-attempt-0001")
+
+    assert (result.replayed, result.booking.id) == (True, winner.id)
+    with pytest.raises(Conflict):
+        world.create(room)  # without a key a sold-out stay is still a 409
+
+
+def test_create_without_key_is_not_deduplicated(world: World, room: RoomTypeInfo) -> None:
+    assert world.create(room).id != world.create(room).id
+
+
+def test_repository_refuses_a_second_booking_under_the_same_key(world: World, room: RoomTypeInfo) -> None:
+    first = world.create(room, idempotency_key="create-attempt-0001")
+    second = world.create(room)
+    second.idempotency_key = "create-attempt-0001"
+    second.id = uuid4()
+
+    with pytest.raises(DuplicateIdempotencyKey):
+        world.bookings.add(second)
+
+    assert world.bookings.find_by_idempotency_key(GUEST, "create-attempt-0001").id == first.id
+
+
+class _InvoicedPolicy(PrepaidBookingPolicy):
+    """A type that is never paid online, yet starts pending (e.g. a corporate invoice)."""
+
+    requires_online_payment = False
+
+
+class _CommittedPrepaidPolicy(PrepaidBookingPolicy):
+    """A prepaid type whose rooms are committed at once although the booking awaits payment."""
+
+    confirms_hold_on_create = True
+
+
+def test_pay_asks_the_type_policy_whether_it_is_payable(room: RoomTypeInfo) -> None:
+    world = World(room, booking_types=BookingTypeRegistry([_InvoicedPolicy(), PayAtPropertyBookingPolicy()]))
+    booking = world.create(room)
+
+    with pytest.raises(BusinessRuleViolation) as raised:
+        world.pay(booking.id)
+
+    assert raised.value.status_code is BOOKING_NOT_PAYABLE
+    assert world.payments.charge_requests == []
+
+
+def test_create_asks_the_type_policy_whether_to_confirm_the_hold(room: RoomTypeInfo) -> None:
+    world = World(room, booking_types=BookingTypeRegistry([_CommittedPrepaidPolicy(), PayAtPropertyBookingPolicy()]))
+
+    booking = world.create(room)
+
+    assert booking.status is BookingStatus.PENDING_PAYMENT
+    assert world.inventory.statuses[booking.hold_id] == "CONFIRMED"
+
+
+def test_guest_contact_uses_the_shared_email_rule() -> None:
+    with pytest.raises(ValidationFailed):
+        GuestContact(name="Rahul", email="a@mail.co.", phone="9876543210")  # catalog already refused this

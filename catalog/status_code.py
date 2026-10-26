@@ -11,4 +11,5 @@ PROPERTY_TYPE_RULE_VIOLATED = StatusCode(2101006, "{reason}", 422)
 INVALID_PROPERTY = StatusCode(2101007, "{reason}", 400)
 ROOM_TYPE_REQUIRED = StatusCode(2101008, "At least one room type is required", 400)
 INVALID_CONTACT = StatusCode(2101009, "{reason}", 400)
-OWNER_ACCOUNT_EXISTS = StatusCode(2101010, "An owner account with this contact email already exists", 409)
+# Generic on purpose: the message never says that the e-mail belongs to another owner's account.
+OWNER_ACCOUNT_EXISTS = StatusCode(2101010, "Owner account could not be created with these contact details", 409)

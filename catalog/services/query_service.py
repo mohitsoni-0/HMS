@@ -1,10 +1,13 @@
 """Catalog reads (LLD §4.4) and the domain -> public snapshot mapping shared with the write services."""
 
 import logging
+import time
+from collections.abc import Callable
 from uuid import UUID
 
 from hotel_commons.exceptions import NotFound
 
+from catalog.constants import AMENITY_CODES_CACHE_SECONDS
 from catalog.domain.owner_account import OwnerAccount
 from catalog.domain.property import Amenity, Property
 from catalog.domain.room_type import RoomType
@@ -16,11 +19,20 @@ logger = logging.getLogger(__name__)
 
 class CatalogQueryService:
     def __init__(
-        self, accounts: OwnerAccountRepository, properties: PropertyRepository, amenities: AmenityRepository
+        self,
+        accounts: OwnerAccountRepository,
+        properties: PropertyRepository,
+        amenities: AmenityRepository,
+        *,
+        amenity_cache_seconds: float = AMENITY_CODES_CACHE_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._accounts = accounts
         self._properties = properties
         self._amenities = amenities
+        self._amenity_cache_seconds = amenity_cache_seconds
+        self._monotonic = monotonic
+        self._amenity_codes: tuple[float, frozenset[str]] | None = None  # (read at, codes)
 
     def get_account(self, account_id: UUID) -> OwnerAccount:
         return self._accounts.get(account_id)
@@ -35,6 +47,18 @@ class CatalogQueryService:
 
     def list_amenities(self) -> list[Amenity]:
         return self._amenities.list_all()
+
+    def known_amenity_codes(self) -> frozenset[str]:
+        """Codes of the active amenities, re-read at most every ``amenity_cache_seconds`` (search calls it a lot).
+
+        The cache is one immutable tuple swapped in whole, so concurrent requests at worst both read the table.
+        """
+        cached, now = self._amenity_codes, self._monotonic()
+        if cached is not None and now - cached[0] < self._amenity_cache_seconds:
+            return cached[1]
+        codes = self._amenities.known_codes()
+        self._amenity_codes = (now, codes)
+        return codes
 
     def room_type_snapshot(self, room_type_id: UUID) -> RoomTypeSnapshot:
         """What booking needs about a room type; NotFound(ROOM_TYPE_NOT_FOUND) when there is none."""

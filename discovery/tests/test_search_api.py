@@ -4,22 +4,28 @@ Listings arrive the production way: a catalog event published on the in-process 
 that ``DiscoveryConfig.ready()`` subscribed. Inventory and pricing are the real contexts.
 """
 
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 import pytest
+from django.conf import settings
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework.test import APIClient
 
 from catalog.public.dto import PropertySnapshot, RoomTypeSummary
 from catalog.public.enums import PricingStrategyCode, PropertyType
 from catalog.public.events import PropertyOnboarded, RoomTypeAdded
+from catalog.tests.openapi_contract import assert_matches_schema
 from discovery.models.listing_models import Listing as ListingRow
 from hotel_commons.domain.clock import business_date
 from hotel_commons.domain.date_range import DateRange
 from hotel_commons.domain.money import Money
 from hotel_commons.events.in_process import event_bus
+from inventory.repositories.room_night_repository import DjangoRoomNightRepository
 from inventory.public.api import get_inventory_api
 
 pytestmark = pytest.mark.django_db
@@ -27,7 +33,9 @@ pytestmark = pytest.mark.django_db
 PROPERTY_ID = UUID("0192f5c4-0000-7000-8000-000000000001")
 DELUXE_ID = UUID("0192f5c4-0000-7000-8000-000000000002")
 SUITE_ID = UUID("0192f5c4-0000-7000-8000-000000000003")
-CHECK_IN = business_date(datetime.now(UTC)) + timedelta(days=10)
+TODAY = business_date(datetime.now(UTC))
+HORIZON_END = TODAY + timedelta(days=settings.INVENTORY_HORIZON_DAYS)
+CHECK_IN = TODAY + timedelta(days=10)
 CHECK_OUT = CHECK_IN + timedelta(days=2)
 
 
@@ -152,6 +160,8 @@ def test_other_city_and_property_type_find_nothing(api_client: APIClient, onboar
         ({"min_price": "0.105"}, "min_price"),
         ({"min_price": "5000", "max_price": "4000"}, "max_price"),
         ({"page_size": 51}, "page_size"),
+        ({"amenities": "WIFI,POLL"}, "amenities"),
+        ({"amenities": "foo"}, "amenities"),
     ],
 )
 def test_invalid_query_returns_validation_envelope(
@@ -162,8 +172,45 @@ def test_invalid_query_returns_validation_envelope(
     assert response.status_code == 400
     body = response.json()
     assert body["status"] == 2100001
-    assert field in body["errors"]
+    assert any(key == field or key.startswith(f"{field}.") for key in body["errors"])  # "x.0": a list item
     assert body["data"] is None
+
+
+@pytest.mark.parametrize(
+    ("check_in", "check_out", "field"),
+    [
+        (TODAY - timedelta(days=2), TODAY, "check_in"),
+        (TODAY - timedelta(days=1), TODAY + timedelta(days=1), "check_in"),
+        (HORIZON_END - timedelta(days=1), HORIZON_END + timedelta(days=1), "check_out"),
+    ],
+)
+def test_stay_outside_the_booking_window_is_refused(
+    api_client: APIClient, onboarded_resort: PropertySnapshot, check_in: date, check_out: date, field: str
+) -> None:
+    for room_type in onboarded_resort.room_types:  # the nights have rows, as they do once time passes
+        DjangoRoomNightRepository().ensure_rows(room_type.room_type_id, 3, DateRange(check_in, check_out).dates())
+
+    response = _search(api_client, check_in=check_in.isoformat(), check_out=check_out.isoformat())
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["status"] == 2100001
+    assert set(body["errors"]) == {field}
+    assert body["data"] is None
+
+
+def test_stays_from_today_to_the_horizon_are_searchable(
+    api_client: APIClient, onboarded_resort: PropertySnapshot
+) -> None:
+    first = _search(api_client, check_in=TODAY.isoformat(), check_out=(TODAY + timedelta(days=1)).isoformat())
+    last = _search(
+        api_client,
+        check_in=(HORIZON_END - timedelta(days=1)).isoformat(),
+        check_out=HORIZON_END.isoformat(),
+    )
+
+    assert (first.status_code, first.json()["data"]["total"]) == (200, 1)
+    assert last.status_code == 200
 
 
 def test_missing_required_parameters_are_reported(api_client: APIClient) -> None:
@@ -192,3 +239,46 @@ def test_room_type_added_reprojects_without_duplicates(onboarded_resort: Propert
     ]
     assert all(row.updation_date is not None for row in rows)
     assert sorted(rows[0].amenity_codes) == ["POOL", "WIFI"]
+
+
+def test_search_responses_match_the_published_schema(api_client: APIClient) -> None:
+    unrated = replace(_snapshot("Unrated Homestay"), star_rating=None, property_type=PropertyType.HOMESTAY)
+    event_bus.publish(PropertyOnboarded(property=unrated))
+    for room_type in unrated.room_types:
+        get_inventory_api().provision(room_type.room_type_id, room_type.total_rooms)
+
+    found = _search(api_client)
+    refused = _search(api_client, amenities="HELIPAD")
+
+    assert found.json()["data"]["items"][0]["star_rating"] is None
+    assert (found.status_code, refused.status_code) == (200, 400)
+    assert_matches_schema(found, "/hotel/v1/discovery/search", "get")
+    assert_matches_schema(refused, "/hotel/v1/discovery/search", "get")
+
+
+def _dynamic_property(index: int, room_types: int) -> PropertySnapshot:
+    snapshot = replace(
+        _snapshot(f"Dynamic {index}"),
+        property_id=UUID(int=1000 + index),
+        pricing_strategy=PricingStrategyCode.DYNAMIC,
+        room_types=tuple(
+            _room_type(UUID(int=10_000 + index * 100 + n), f"Room {n}", 4000, set()) for n in range(room_types)
+        ),
+    )
+    event_bus.publish(PropertyOnboarded(property=snapshot))
+    for room_type in snapshot.room_types:
+        get_inventory_api().provision(room_type.room_type_id, room_type.total_rooms)
+    return snapshot
+
+
+def test_search_query_count_does_not_grow_with_dynamic_listings(api_client: APIClient) -> None:
+    """B3: occupancy for every DYNAMIC candidate is read in one query, not one per room type."""
+    _dynamic_property(1, 2)
+    with CaptureQueriesContext(connection) as few:
+        assert _search(api_client).json()["data"]["total"] == 1
+    _dynamic_property(2, 3)
+    _dynamic_property(3, 3)
+    with CaptureQueriesContext(connection) as many:
+        assert _search(api_client).json()["data"]["total"] == 3
+
+    assert len(many) == len(few) == 3  # listings, availability, occupancy

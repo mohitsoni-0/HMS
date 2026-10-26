@@ -6,11 +6,19 @@
 - ``enforced``: like ``optional``, but a request without the headers gets 400 ``PAYLOAD_NOT_ENCRYPTED``.
 Paths in ``API_ENCRYPTION_BYPASS_PATHS`` (exact match) always pass in plaintext.
 
-An encrypted request is rate-limited by client IP before any RSA work, then its timestamp is checked
-(±300 s), its AES key unwrapped and claimed once in Redis (replay guard), and its body decrypted into
-``request._body`` as JSON. The view's JSON response, success or error, is sealed with the same key. This
-middleware's own rejections are plain ``JsonResponse`` envelopes, never exceptions, and are not encrypted:
-the client must be able to read why its request was refused.
+An encrypted request is rate-limited by client IP before any RSA work (``RATE_LIMIT_POLICIES["encrypted"]``),
+then its timestamp is checked (±300 s), its AES key unwrapped and claimed once in Redis (replay guard), and
+its body decrypted into ``request._body`` as JSON. The AAD binds method, path, query string and timestamp,
+and every method but GET/HEAD/OPTIONS must carry a sealed body, so a state-changing request cannot be
+re-targeted, re-timed or stripped of its body. The view's JSON response, success or error, is sealed with
+the same key. This middleware's own rejections are plain ``JsonResponse`` envelopes, never exceptions, and
+are not encrypted: the client must be able to read why its request was refused.
+
+The replay guard keeps each wrapped key for ``REPLAY_TTL_SECONDS``: a timestamp is accepted from
+``ts - skew`` to ``ts + skew``, so the guard must outlive that whole 2 × skew window, plus a margin for
+clock drift between app instances. A bodyless (GET/HEAD/OPTIONS) request has no sealed payload, so its
+timestamp header is not authenticated; such a request changes nothing and its response is sealed with a
+key only the original client holds.
 """
 
 import hashlib
@@ -27,6 +35,7 @@ from django.http import HttpRequest, HttpResponse, JsonResponse
 from redis.exceptions import RedisError
 
 from hotel_commons.api.response import error_body
+from hotel_commons.api.throttling import rate_limit_policy
 from hotel_commons.consts import (
     API_ENCRYPTION_ENFORCED,
     API_ENCRYPTION_OFF,
@@ -36,41 +45,48 @@ from hotel_commons.consts import (
     RETRY_AFTER_HEADER,
 )
 from hotel_commons.exceptions import AppError, TooManyRequests, ValidationFailed
-from hotel_commons.ratelimit.interfaces import RateLimiter, RateLimitPolicy
+from hotel_commons.ratelimit.interfaces import RateLimiter
 from hotel_commons.ratelimit.redis_sliding_window import RedisSlidingWindowRateLimiter
 from hotel_commons.redis.client import get_redis, redis_key
 from hotel_commons.security.api_crypto import (
     MAX_CLOCK_SKEW_SECONDS,
     PAYLOAD_FIELD,
     WIRE_VERSION,
+    aad_target,
     get_payload_cipher,
     payload_aad,
+    requires_sealed_body,
 )
 from hotel_commons.security.client_ip import client_ip
 from hotel_commons.status_code import PAYLOAD_DECRYPTION_FAILED, PAYLOAD_NOT_ENCRYPTED, RATE_LIMITED
 
 logger = logging.getLogger(__name__)
 
-ENCRYPTED_POLICY: Final = RateLimitPolicy("encrypted", 300, 60)
-REPLAY_TTL_SECONDS: Final = MAX_CLOCK_SKEW_SECONDS
+ENCRYPTED_SCOPE: Final = "encrypted"
+REPLAY_TTL_MARGIN_SECONDS: Final = 60
+REPLAY_TTL_SECONDS: Final = 2 * MAX_CLOCK_SKEW_SECONDS + REPLAY_TTL_MARGIN_SECONDS
+MAX_TIMESTAMP_DIGITS: Final = 12  # unix seconds stay 10 digits until the year 2286
 JSON_CONTENT_TYPE: Final = "application/json"
 _ENCRYPTION_HEADERS: Final = (PAYLOAD_ENCRYPTION_HEADER, ENCRYPTED_KEY_HEADER, PAYLOAD_TIMESTAMP_HEADER)
 
 
 @dataclass(frozen=True)
 class EncryptedExchange:
-    """The decrypted request's AES key and AAD parts, kept on ``request.encrypted_exchange`` for the response."""
+    """The decrypted request's AES key and AAD parts, kept on ``request.encrypted_exchange`` for the response.
+
+    ``target`` is the URL path plus ``?`` and the raw query string when there is one.
+    """
 
     aes_key: bytes = field(repr=False)
     method: str
-    path: str
+    target: str
     timestamp: int
 
     def request_aad(self) -> str:
-        return payload_aad("req", self.method, self.path, self.timestamp)
+        return payload_aad("req", self.method, self.target, self.timestamp)
 
     def response_aad(self) -> str:
-        return payload_aad("res", self.method, self.path, self.timestamp)
+        return payload_aad("res", self.method, self.target, self.timestamp)
 
 
 class ApiEncryptionMiddleware:
@@ -102,7 +118,7 @@ class ApiEncryptionMiddleware:
     def _check_rate_limit(self, request: HttpRequest) -> None:
         if not settings.RATE_LIMIT_ENABLED:
             return
-        decision = self._limiter().hit(f"ip:{client_ip(request)}", ENCRYPTED_POLICY)
+        decision = self._limiter().hit(f"ip:{client_ip(request)}", rate_limit_policy(ENCRYPTED_SCOPE))
         if not decision.allowed:
             raise TooManyRequests(RATE_LIMITED, retry_after_seconds=decision.retry_after_seconds)
 
@@ -117,16 +133,24 @@ def _carries_encryption_headers(request: HttpRequest) -> bool:
 
 
 def _open_request(request: HttpRequest) -> EncryptedExchange:
-    """Checks in the order of the wire format: version, timestamp, key unwrap, replay, body decryption."""
+    """Checks in the order of the wire format: version, timestamp, body presence, key unwrap, replay, decryption.
+
+    A method that must carry a body (see ``requires_sealed_body``) is refused when the body is empty.
+    """
     if request.headers.get(PAYLOAD_ENCRYPTION_HEADER) != WIRE_VERSION:
         raise _rejected("missing or unsupported encryption version")
     wrapped_key = request.headers.get(ENCRYPTED_KEY_HEADER, "")
     if not wrapped_key:
         raise _rejected("missing wrapped key")
     timestamp = _fresh_timestamp(request.headers.get(PAYLOAD_TIMESTAMP_HEADER, ""))
+    if not request.body and requires_sealed_body(request.method):
+        raise _rejected("sealed body missing")
     cipher = get_payload_cipher()
     exchange = EncryptedExchange(
-        aes_key=cipher.unwrap_key(wrapped_key), method=request.method, path=request.path, timestamp=timestamp
+        aes_key=cipher.unwrap_key(wrapped_key),
+        method=request.method,
+        target=aad_target(request.path, request.META.get("QUERY_STRING", "")),
+        timestamp=timestamp,
     )
     _claim_wrapped_key(wrapped_key)
     if request.body:
@@ -136,7 +160,7 @@ def _open_request(request: HttpRequest) -> EncryptedExchange:
 
 
 def _fresh_timestamp(raw: str) -> int:
-    if not raw.isascii() or not raw.isdigit():
+    if not raw.isascii() or not raw.isdigit() or len(raw) > MAX_TIMESTAMP_DIGITS:
         raise _rejected("timestamp is not unix seconds")
     timestamp = int(raw)
     if abs(time.time() - timestamp) > MAX_CLOCK_SKEW_SECONDS:

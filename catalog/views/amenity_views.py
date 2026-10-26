@@ -2,7 +2,7 @@
 
 from drf_spectacular.utils import extend_schema
 from hotel_commons.api.response import api_response
-from hotel_commons.api.schema import ERROR_ENVELOPE, envelope
+from hotel_commons.api.schema import ERROR_ENVELOPE, envelope_list
 from hotel_commons.api.views import BaseViewSet
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
@@ -19,7 +19,7 @@ class AmenityViewSet(BaseViewSet):
         operation_id="catalog_amenities_list",
         tags=["catalog"],
         auth=[],
-        responses={200: envelope(AmenitySerializer(many=True), "AmenityListEnvelope"), 429: ERROR_ENVELOPE},
+        responses={200: envelope_list(AmenitySerializer, "AmenityListEnvelope"), 429: ERROR_ENVELOPE},
     )
     def list(self, request: Request) -> Response:
         amenities = container.query_service().list_amenities()

@@ -3,12 +3,17 @@
 Every test needs the database and the full project: run by integration with pytest-django.
 """
 
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from django.db import connection
 from django.urls import reverse
+from drf_spectacular.generators import SchemaGenerator
+from hotel_commons.domain.clock import SystemClock
 from hotel_commons.domain.money import Money
+from hotel_commons.exceptions import BusinessRuleViolation
+from hotel_commons.status_code import IDEMPOTENCY_KEY_REUSED
 from hotel_commons.testing.tokens import auth_header
 from rest_framework.test import APIClient
 from uuid6 import uuid7
@@ -25,16 +30,24 @@ from payment.repositories.payment_repository import DjangoPaymentRepository
 pytestmark = pytest.mark.django_db
 
 GUEST = "guest-1"
+UPI = {"vpa": "rahul@okaxis"}
 
 
-def charge(*, payer_id: str = GUEST, key: str | None = None, rupees: str = "9600.00") -> PaymentDTO:
+def card(number: str = "4242424242424242") -> dict[str, Any]:
+    """A card valid against the container's real clock: it expires two years from now, never in the past."""
+    return {"card_number": number, "expiry_month": 12, "expiry_year": SystemClock().today().year + 2,
+            "cvv": "987", "holder_name": "Rahul Sharma"}
+
+
+def charge(*, payer_id: str = GUEST, key: str | None = None, rupees: str = "9600.00", method: str = "UPI",
+           details: dict[str, Any] | None = None) -> PaymentDTO:
     return get_payment_api().charge(
         ChargeCommand(
             booking_id=uuid7(),
             payer_id=payer_id,
             amount=Money.of_rupees(rupees),
-            method="UPI",
-            method_details={"vpa": "rahul@okaxis"},
+            method=method,
+            method_details=UPI if details is None else details,
             idempotency_key=key or f"pay:{uuid4().hex}",
         )
     )
@@ -112,7 +125,8 @@ def test_duplicate_insert_raises_duplicate_payment_and_keeps_transaction_usable(
 
     def new_payment() -> Payment:
         return Payment.initiate(
-            booking_id=uuid7(), payer_id=GUEST, amount=Money(100), instrument=instrument, idempotency_key="pay:dup"
+            booking_id=uuid7(), payer_id=GUEST, amount=Money(100), instrument=instrument, idempotency_key="pay:dup",
+            request_fingerprint="0" * 64,
         )
 
     first = new_payment()
@@ -141,3 +155,41 @@ def test_partial_refund_updates_payment_and_appends_log_rows() -> None:
     assert stored.refunded_amount == Money.of_rupees("400.00")
     assert PaymentLog.objects.filter(log_id=payment.payment_id).count() == 3  # insert, charge outcome, refund
     assert RefundLog.objects.filter(log_id=result.refund_id).count() == 1
+
+
+def test_request_fingerprint_is_stored_without_the_instrument() -> None:
+    charge(key="pay:booking-1:fp", method="CARD", details=card())
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            'SELECT request_fingerprint FROM "payment"."payment" WHERE idempotency_key = %s', ["pay:booking-1:fp"]
+        )
+        (fingerprint,) = cursor.fetchone()
+    assert len(fingerprint) == 64
+    assert "4242" not in fingerprint
+
+
+def test_key_reused_for_another_method_is_rejected_after_a_decline() -> None:
+    declined = charge(key="pay:booking-1:k", method="CARD", details=card("4000000000000002"))
+    api = get_payment_api()
+
+    replay = api.find_by_idempotency_key("pay:booking-1:k", method="CARD", method_details=card("4000000000000002"))
+
+    assert declined.status is PaymentStatus.FAILED
+    assert replay == declined
+    for reuse in (
+        lambda: api.find_by_idempotency_key("pay:booking-1:k", method="UPI", method_details=UPI),
+        lambda: charge(key="pay:booking-1:k", method="UPI", details=UPI),
+    ):
+        with pytest.raises(BusinessRuleViolation) as error:
+            reuse()
+        assert error.value.status_code is IDEMPOTENCY_KEY_REUSED
+
+
+def test_schema_lists_gateway_txn_id_as_optional() -> None:
+    payment = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]["Payment"]
+
+    assert "gateway_txn_id" in payment["properties"]
+    assert "gateway_txn_id" not in payment["required"]
+    assert {"payment_id", "status", "failure_code", "failure_message"} <= set(payment["required"])
+    assert payment["properties"]["failure_code"]["nullable"] is True

@@ -1,8 +1,9 @@
 """Payment tables in schema ``payment`` (LLD §9.7): payment/payment_log and refund/refund_log.
 
 Amounts are BIGINT paisa, enums SMALLINT. The UPI VPA or wallet phone is ``instrument_ref``, encrypted at
-rest; card data is never stored. The unique idempotency keys live on the live tables only, so log snapshots
-never collide.
+rest; card data is never stored, only ``request_fingerprint``, an HMAC of the charge request that tells a
+replay of an idempotency key from its reuse for another request (NULL on rows from before it). The unique
+idempotency keys live on the live tables only, so log snapshots never collide.
 """
 
 from django.contrib.postgres.indexes import BrinIndex
@@ -36,6 +37,7 @@ class CommonPayment(AddCommonField):
     failure_code = models.CharField(max_length=64, null=True, blank=True)
     failure_message = models.CharField(max_length=255, null=True, blank=True)
     idempotency_key = models.CharField(max_length=200)
+    request_fingerprint = models.CharField(max_length=64, null=True, blank=True)
 
     class Meta:
         abstract = True

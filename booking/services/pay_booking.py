@@ -3,7 +3,9 @@
 Declined and expired payments are outcomes, not errors: the state they leave (the failure recorded, the
 booking expired and its rooms released) must commit, so the service returns them and the view answers
 402 or 409 with the booking in ``data``. The durable replay check comes first, under the booking's row lock:
-a retry with the same Idempotency-Key gets the original result even after Redis has forgotten the key.
+a retry with the same Idempotency-Key gets the original result even after Redis has forgotten the key, and
+a key reused with a different method or instrument is refused (422 IDEMPOTENCY_KEY_REUSED) just as the
+Redis layer refuses it. Whether a booking can be paid online at all is its type policy's call.
 """
 
 import logging
@@ -17,7 +19,8 @@ from hotel_commons.events.interfaces import EventPublisher
 from hotel_commons.exceptions import BusinessRuleViolation, Conflict
 
 from booking.domain.booking import Booking
-from booking.enums import BookingStatus, BookingType
+from booking.domain.booking_types import BookingTypeRegistry
+from booking.enums import BookingStatus
 from booking.interfaces.ports import ChargeRequest, ChargeResult, InventoryPort, PaymentPort
 from booking.interfaces.repositories import BookingRepository
 from booking.public.events import BookingConfirmed, BookingExpired
@@ -42,6 +45,7 @@ class PayBookingService:
         bookings: BookingRepository,
         payments: PaymentPort,
         inventory: InventoryPort,
+        booking_types: BookingTypeRegistry,
         events: EventPublisher,
         uow: UnitOfWork,
         clock: Clock,
@@ -49,6 +53,7 @@ class PayBookingService:
         self._bookings = bookings
         self._payments = payments
         self._inventory = inventory
+        self._booking_types = booking_types
         self._events = events
         self._uow = uow
         self._clock = clock
@@ -57,11 +62,11 @@ class PayBookingService:
         key = f"pay:{cmd.booking_id}:{cmd.idempotency_key}"
         with self._uow:
             booking = self._bookings.get_for_update(cmd.booking_id)
-            prior = self._payments.find_charge(key)
+            prior = self._payments.find_charge(key, cmd.method, cmd.method_details)
             if prior:
                 logger.info("Booking %s payment replayed from payment %s", booking.id, prior.payment_id)
                 return PayBookingResult(booking, "PAID" if prior.succeeded else "DECLINED", prior)
-            if booking.booking_type is BookingType.PAY_AT_PROPERTY:
+            if not self._booking_types.get(booking.booking_type).requires_online_payment:
                 raise BusinessRuleViolation(BOOKING_NOT_PAYABLE)
             if booking.status is BookingStatus.EXPIRED:
                 return PayBookingResult(booking, "EXPIRED", None)
