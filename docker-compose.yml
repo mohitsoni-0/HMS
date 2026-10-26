@@ -1,0 +1,78 @@
+# Local stack: PostgreSQL 18, Redis 7, the API (gunicorn) and the background scheduler.
+# Start it with ./local_run.sh (or: docker compose up --build).
+# The app and scheduler read DEV-ONLY settings from .env.example; an optional .env overrides them.
+
+x-app: &app
+  image: hotel-booking-service:local
+  env_file:
+    - path: .env.example
+    - path: .env
+      required: false
+  volumes:
+    # DEV-ONLY RSA key for API payload encryption: mounted read-only, never baked into the image.
+    - ./secrets/dev:/app/secrets/dev:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: hotel
+      POSTGRES_USER: hotel
+      POSTGRES_PASSWORD: hotel
+    ports:
+      - "5432:5432"
+    volumes:
+      # PostgreSQL 18 images keep their data under /var/lib/postgresql/<major>/docker.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # Over TCP on purpose: during first-time initialisation the server listens only on its Unix socket.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "hotel", "-d", "hotel"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    <<: *app
+    # Local-only image tag: always built from this repository (layer-cached), never pulled.
+    build: .
+    pull_policy: build
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # Healthy once migrations and demo data are in and gunicorn answers. The scheduler waits for this.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; urllib.request.urlopen('http://localhost:8000/hotel/' + os.environ.get('API_VERSION', 'v1') + '/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  scheduler:
+    <<: *app
+    # Same image as app, which builds it once; never pulled from a registry.
+    pull_policy: never
+    entrypoint: ["/app/docker/scheduler.sh"]
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  pgdata:

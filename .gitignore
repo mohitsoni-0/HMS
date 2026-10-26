@@ -3,3 +3,17 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+
+# Local env variants stay untracked; only the documented DEV-ONLY example is committed.
+.env.*
+!.env.example
+
+# Real keys never belong in git: only the DEV-ONLY folder under secrets/ is tracked.
+secrets/*
+!secrets/dev/
+
+# Build, coverage and OS artifacts
+*.egg-info/
+.coverage
+htmlcov/
+.DS_Store

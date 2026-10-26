@@ -1,0 +1,30 @@
+# The build context carries code, requirements and the shared library. Host tooling, docs, caches,
+# env files and keys stay out. Configuration and keys reach containers at runtime (compose env_file,
+# read-only secrets mount), so they are never in an image layer.
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+local_run.sh
+run-tests.sh
+.env
+.env.*
+!.env.example
+secrets/
+
+# Virtualenvs, caches and build artifacts
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docs and editor/OS files
+docs/
+.idea/
+.vscode/
+**/.DS_Store

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotel-commons"
+version = "0.1.0"
+description = "Shared kernel and infrastructure for the hotel booking service: settings, security, models, API helpers."
+requires-python = ">=3.12"
+dependencies = [
+    "Django==5.2.*",
+    "djangorestframework==3.16.*",
+    "drf-spectacular>=0.28,<0.30",
+    "redis>=5.2,<7",
+    "PyJWT==2.10.*",
+    "cryptography>=44,<47",
+    "uuid6==2025.0.1",
+]
+
+[project.optional-dependencies]
+# hotel_commons.testing and REDIS_URL=fakeredis:// need these; production installs leave them out.
+test = [
+    "pytest==8.*",
+    "pytest-django==4.9.*",
+    "fakeredis[lua]>=2.26",
+]
+
+[tool.setuptools.packages.find]
+include = ["hotel_commons*"]
