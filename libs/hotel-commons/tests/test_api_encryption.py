@@ -28,6 +28,8 @@ if not settings.configured:
             "DEFAULT_AUTHENTICATION_CLASSES": [],
             "DEFAULT_PERMISSION_CLASSES": [],
             "DEFAULT_THROTTLE_CLASSES": [],
+            # As base_settings: whichever module configures Django first, later modules generate OpenAPI schemas.
+            "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
             "UNAUTHENTICATED_USER": None,
         },
     )

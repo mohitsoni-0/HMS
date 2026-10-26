@@ -52,7 +52,8 @@ services:
     build: .
     pull_policy: build
     ports:
-      - "8000:8000"
+      # Host port 8000, unless APP_PORT says otherwise (e.g. in an untracked .env when 8000 is taken locally).
+      - "${APP_PORT:-8000}:8000"
     healthcheck:
       # Healthy once migrations and demo data are in and gunicorn answers. The scheduler waits for this.
       test:

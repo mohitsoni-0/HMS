@@ -498,6 +498,14 @@ def test_redact_pii_patterns(text, expected):
     assert redact_pii(expected) == expected  # masks are stable
 
 
+def test_redact_pii_keeps_uuids_whole():
+    # A UUIDv7's leading digits pass for a card number ("17904-2851-7046"), and so may a digit-only tail.
+    text = "booking 01a17904-2851-7046-a3f0-df0c3d0e88ca hold 0192f5c4-0000-7000-8000-987654321012 card 4242424242424242"
+    assert redact_pii(text) == (
+        "booking 01a17904-2851-7046-a3f0-df0c3d0e88ca hold 0192f5c4-0000-7000-8000-987654321012 card ************4242"
+    )
+
+
 def test_pii_redaction_masks_exception_text_and_survives_bad_args():
     try:
         raise ValueError("duplicate contact rahul@gmail.com")

@@ -22,6 +22,7 @@ hotel-booking-service/
 ├── tests/                            # cross-app tests
 │   ├── architecture/test_module_boundaries.py      (optional, built last)
 │   ├── integration/test_booking_flow_api.py
+│   ├── integration/test_common_fields_and_logs.py
 │   └── integration/test_inventory_concurrency.py
 ├── secrets/dev/api_rsa_private.pem   # DEV-ONLY key for local runs; refused when ENVIRONMENT != local
 ├── docs/HLD.md  docs/LLD.md
@@ -120,7 +121,7 @@ hotel_commons/
 │                            # jwt_tokens.py, api_crypto.py, idor.py, field_level.py, permissions.py, client_ip.py
 ├── middlewares/             # request_context.py, exception_handling.py, api_encryption.py, authentication.py
 ├── api/                     # response.py, exception_handler.py, views.py, pagination.py, throttling.py,
-│                            # authentication.py, fields.py, schema.py, system_views.py, error_views.py, urls.py
+│                            # authentication.py, schema.py, system_views.py, encryption_views.py, error_views.py, urls.py
 ├── ratelimit/               # interfaces.py, redis_sliding_window.py
 ├── idempotency/             # interfaces.py, redis_store.py, decorators.py
 ├── events/                  # base.py, interfaces.py, in_process.py
@@ -644,7 +645,8 @@ ERROR_ENVELOPE: Serializer                                       # {status, mess
 
 # hotel_commons/api/system_views.py — APIView subclasses, permission AllowAny
 class HealthView(APIView): ...        # GET: SELECT 1 + Redis PING -> {"database": "ok", "redis": "ok"|"down"}; throttle_classes = []
-class PublicKeyView(APIView): ...     # GET: {"algorithm": "RSA-OAEP-256+A256GCM", "public_key_pem": "..."}
+                                      # database down -> 503 with "database": "down"; Redis down alone still answers 200
+class PublicKeyView(APIView): ...     # in api/encryption_views.py; GET: {"algorithm": "RSA-OAEP-256+A256GCM", "public_key_pem": "..."}
 class DevTokenView(APIView): ...      # POST {"user_id", "roles": [...]} -> {"token", "expires_in"};
                                       # ADMIN refused unless DEV_TOKENS_ALLOW_ADMIN; route exists only when ENVIRONMENT == "local"
 
@@ -763,7 +765,7 @@ Decorator algorithm, applied to a DRF view method:
 2. Store key `hb:idem:v1:{scope}:{principal.user_id}:{key}`. Fingerprint = `HMAC-SHA256(IDEMPOTENCY_FINGERPRINT_KEY, f"{METHOD}|{path}|{canonical JSON of request.data}")`.
 3. `begin`:
    - `RedisError` → log WARNING and run the view without the Redis layer; the Postgres unique keys still apply.
-   - `replay` → return the stored response with header `Idempotent-Replayed: true`.
+   - `replay` → return the stored response, its `request_id` set to the retry's own, with header `Idempotent-Replayed: true`.
    - `in_progress` → 409.
    - `mismatch` → 422.
 4. `started` → run the view.
@@ -799,7 +801,7 @@ event_bus = InProcessEventBus()
 ### 3.13 Redis client, logging, settings, commands, testing
 
 - **`redis/client.py`**: `get_redis()` is lru-cached. `REDIS_URL` starting with `fakeredis://` → a process-wide `fakeredis.FakeRedis(decode_responses=True)`. Otherwise `Redis.from_url(..., decode_responses=True, socket_timeout=0.5, socket_connect_timeout=0.5)`. Also `redis_key(*parts)`, prefixed `hb:`.
-- **`logging/filters.py`**: `RequestIdFilter` adds `request_id` and `actor`. `PiiRedactionFilter` masks emails, 10-digit mobiles, 13–19 digit card numbers and `"cvv": "..."` values in `msg` and `args`. `logging/config.py` provides `build_logging_config(level)`.
+- **`logging/filters.py`**: `RequestIdFilter` adds `request_id` and `actor`. `PiiRedactionFilter` masks emails, 10-digit mobiles, 13–19 digit card numbers and `"cvv": "..."` values in `msg` and `args`. UUIDs, the ids services log, are left whole: a UUIDv7's leading digits would otherwise pass for a card number. `logging/config.py` provides `build_logging_config(level)`.
 - **`settings/base_settings.py`** reads env with these defaults:
   - INSTALLED_APPS core: `contenttypes`, `auth`, `staticfiles`, `rest_framework`, `drf_spectacular`, `hotel_commons`.
   - MIDDLEWARE as §3.8. `APPEND_SLASH = False`, `ATOMIC_REQUESTS = False`, `USE_TZ = True`, `TIME_ZONE = "Asia/Kolkata"`.
@@ -883,7 +885,7 @@ class BookingCreateSerializer(BaseHotelSerializer):
 class BookingSerializer(BaseHotelSerializer):
     booking_id = HotelUUIDField(source="id")
     status = HotelEnumField(BookingStatus)
-    total_amount = HotelAmountField(source="price.total")
+    total = HotelAmountField(source="price.total")
     currency = HotelCharField(source="price.total.currency")
     guest_email = HotelEncryptedCharField(source="contact.email", read_roles=[Role.ADMIN],
                                           subject_attr="guest_id", mask_as=PiType.EMAIL)
@@ -917,7 +919,7 @@ def create_schema_operation(schema: str) -> migrations.RunSQL:
 
 - Each app's `0001_initial` migration begins with `create_schema_operation("<schema>")`; tables are created schema-qualified.
 - Tests run migrations (no `--nomigrations`), so test databases get the schemas too.
-- Index and constraint names are explicit and prefixed with the table, e.g. `booking_booking_status_hold_idx`.
+- Index and constraint names are explicit and start with the schema and table, e.g. `catalog_room_type_property_name_uniq`, `payment_refund_log_brin`; a table named like its schema is not repeated (`booking_dates_valid`). Django caps index names at 30 characters, so longer ones are shortened: `booking_status_hold_idx`, `catalog_owner_acc_log_brin`.
 
 **Why schemas, and why one connection.**
 - A schema is the ownership boundary of a context and the unit of a future split: `pg_dump --schema=booking` moves it to its own database. There are no cross-schema foreign keys, so nothing has to be untangled.
@@ -1008,7 +1010,7 @@ DEFAULT_PROPERTY_RULES: tuple[PropertyTypeRule, ...] = (StarRatingRequiredRule()
 
 Commands (`catalog/services/commands.py`):
 - `OwnerAccountDraft(display_name, contact_email, contact_phone)`
-- `RoomTypeDraft(name, max_occupancy, total_rooms, base_price: Decimal, amenity_codes: frozenset[str], description="")`
+- `RoomTypeDraft(name, max_occupancy, total_rooms, base_price: Money, amenity_codes: frozenset[str], description="")` (paisa: rupees become paisa only in `HotelAmountField`)
 - `PropertyDraft(name, property_type, star_rating, address: Address, amenity_codes, pricing_strategy, cancellation_policy, check_in_time, check_out_time, description, room_types: tuple[RoomTypeDraft, ...])`
 
 ### 4.3 Interfaces
@@ -1576,7 +1578,8 @@ class BookingRepository(ABC):
     def get(self, booking_id: UUID) -> Booking: ...                 # NotFound(BOOKING_NOT_FOUND)
     def get_for_update(self, booking_id: UUID) -> Booking: ...      # SELECT ... FOR UPDATE
     def save(self, booking: Booking) -> None: ...
-    def list_for_guest(self, guest_id: str, *, page: int, page_size: int) -> tuple[list[Booking], int]: ...
+    def list_for_guest(self, guest_id: str, *, page: int, page_size: int,
+                       property_id: UUID | None = None) -> tuple[list[Booking], int]: ...   # property_id: ADMIN only
     def list_for_property(self, property_id: UUID, *, page: int, page_size: int) -> tuple[list[Booking], int]: ...
     def find_expired_pending_ids(self, now: datetime, limit: int) -> list[UUID]: ...
         # plain SELECT: booking_status = PENDING_PAYMENT AND hold_expires_at <= now ORDER BY hold_expires_at
@@ -1984,7 +1987,7 @@ Notation: IDOR `resource/key/source/relations`. All bodies are JSON. Responses u
 | 2 | `GET /security/public-key` | `PublicKeyView.get` | public | — | — | default | — | `{algorithm, public_key_pem}` |
 | 3 | `POST /dev/tokens` (local) | `DevTokenView.post` | public | — | — | default | `DevTokenRequestSerializer` | `{token, expires_in}` |
 | 4 | `GET /catalog/amenities` | `AmenityViewSet.list` | public | — | — | default | — | `[AmenitySerializer]` |
-| 5 | `POST /catalog/owner-accounts` | `OwnerAccountViewSet.create` | OWNER, ADMIN | — | `catalog_write` opt | catalog_write | `OwnerAccountCreateSerializer` | `OwnerAccountSerializer` |
+| 5 | `POST /catalog/owner-accounts` | `OwnerAccountViewSet.create` | OWNER, ADMIN | — | `catalog_write` opt | catalog_write | `OwnerAccountCreateSerializer` | `OwnerAccountSerializer` (201) |
 | 6 | `GET /catalog/owner-accounts/{account_id}/properties` | `PropertyViewSet.list_for_account` | OWNER, ADMIN | owner_account/account_id/path/{owner} | — | default | — | `[PropertySerializer]` |
 | 7 | `POST /catalog/owner-accounts/{account_id}/properties` | `PropertyViewSet.onboard` | OWNER, ADMIN | same as 6 | `catalog_write` opt | catalog_write | `PropertyOnboardSerializer` | `PropertySerializer` (201) |
 | 8 | `GET /catalog/properties/{property_id}` | `PropertyViewSet.retrieve` | public | — | — | default | — | `PropertySerializer` |
@@ -1999,9 +2002,9 @@ Notation: IDOR `resource/key/source/relations`. All bodies are JSON. Responses u
 | 17 | `GET /schema`, `GET /docs` | drf-spectacular | public | — | — | none | — | OpenAPI 3 / Swagger UI |
 
 `GET /bookings` scoping:
-- **GUEST** sees own bookings only (an optional `property_id` narrows them).
+- **GUEST** sees own bookings only, with no property filter: the `property_id` IDOR rule is owner-only, so a GUEST-only caller who sends `property_id` gets 404.
 - **OWNER** must pass `property_id` (400 `LIST_FILTER_REQUIRED` otherwise); the IDOR rule then checks the property is theirs.
-- **ADMIN** passes `property_id` or `guest_id`.
+- **ADMIN** passes `property_id` or `guest_id` (both together: that guest's bookings at that property); neither → 400 `INVALID_BOOKING_REQUEST`.
 
 ### 10.3 Serializers (fields; `→` marks output-only)
 
@@ -2081,7 +2084,7 @@ Idempotency-Key: pay-0192f5c5-attempt-1
 | Paid | 200 | 2100000 | `{"booking": {"status": "CONFIRMED", …}, "payment": {"status": "SUCCEEDED", "instrument": "VISA •••• 4242", …}}` |
 | Declined (card ending 0002) | 402 | 2105004 | `{"booking": {"status": "PENDING_PAYMENT", …}, "payment": {"status": "FAILED", "failure_code": "card_declined", …}}` |
 | Hold expired | 409 | 2105003 | `{"booking": {"status": "EXPIRED", …}, "payment": null}` |
-| Same key again | as first | as first | as first, plus header `Idempotent-Replayed: true` |
+| Same key again | as first | as first | as first (`request_id` is the retry's), plus header `Idempotent-Replayed: true` |
 
 Other methods: `{"method": "UPI", "upi": {"vpa": "rahul@okaxis"}}` · `{"method": "WALLET", "wallet": {"provider": "PAYTM", "phone": "9876543210"}}`.
 
@@ -2132,7 +2135,7 @@ Migrations: one initial migration per app, plus `catalog/migrations/0002_seed_am
 
 `docker-compose.yml` services:
 - `postgres` (`postgres:18`, healthcheck) and `redis` (`redis:7-alpine`).
-- `app`: built from the Dockerfile on `python:3.13-slim`, with `env_file: [.env.example, {path: .env, required: false}]`. Its entrypoint runs `migrate && seed_demo && gunicorn hotel_booking_service.wsgi -b 0.0.0.0:8000 -w 3`.
+- `app`: built from the Dockerfile on `python:3.13-slim`, with `env_file: [.env.example, {path: .env, required: false}]`. Its entrypoint runs `migrate && seed_demo && gunicorn hotel_booking_service.wsgi -b 0.0.0.0:8000 -w 3`. It is published on host port `${APP_PORT:-8000}`, so a machine where 8000 is taken sets `APP_PORT` in its untracked `.env`.
 - `scheduler`: the same image, running `while true; do python manage.py expire_pending_bookings; python manage.py extend_inventory_horizon; sleep 60; done`.
 
 ## 14. Test plan
@@ -2148,7 +2151,7 @@ Unit tests run without a database, using in-memory repositories and fakes. DB an
 | Idempotency | `…/tests/test_idempotency.py` | replay; in progress → 409; mismatch → 422; AppError 4xx stored; 5xx releases; RedisError → view still runs; stored value starts with `ENC_` |
 | IDOR, field policies | `…/tests/test_idor.py`, `test_field_level.py` | other guest → 404; {GUEST, OWNER} token cannot cancel another guest's booking at own property → 404; owner masked view; subject sees own PII; restricted write → 403 |
 | API encryption | `…/tests/test_api_encryption.py` | round trip; enforced rejects plaintext; tampered payload → 400; replayed key → 400; stale timestamp → 400 |
-| Common fields + logs (db) | `…/tests/test_common_fields_and_logs.py` | insert stamps creation_by; update stamps updation_*; one log row per save/update/bulk_create; request_id on logs; raw SQL shows `ENC_` ciphertext in live and log tables; `makemigrations --check` clean |
+| Common fields + logs (db) | `tests/integration/test_common_fields_and_logs.py` | insert stamps creation_by; update stamps updation_*; one log row per save/update/bulk_create; request_id on logs; raw SQL shows `ENC_` ciphertext in live and log tables; `makemigrations --check` clean |
 | Catalog | `catalog/tests/test_property_domain.py` | onboard validation; type rules (villa, hotel rating); add_room_type re-checks rules; duplicate names; standalone and chain accounts share one path |
 | Inventory | `inventory/tests/test_inventory_service.py` | hold/confirm/release; idempotent release; horizon edges; missing rows auto-created |
 | Concurrency (db) | `tests/integration/test_inventory_concurrency.py` | `@pytest.mark.django_db(transaction=True)`; one room; 10 threads behind `threading.Barrier(10)` call `get_inventory_api().hold(...)`; each closes `django.db.connection` in `finally`; exactly 1 success and 9 `INVENTORY_UNAVAILABLE`; `reserved_rooms == 1`. Second test: overlapping stays (1–3 vs 2–4) race in both orders — no deadlock |

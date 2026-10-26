@@ -19,6 +19,8 @@ _CVV = re.compile(r"""(?i)(?P<key>["']?(?<![A-Za-z0-9])cvv["']?\s*[:=]\s*["']?)[
 _EMAIL = re.compile(r"(?P<first>[A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@(?P<domain>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)")
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 _PHONE = re.compile(r"(?<![\d+])(?:\+?91[ -]?)?[6-9]\d{9}(?!\d)")
+# Capturing, so that split() keeps each UUID in the result (at the odd indexes).
+_UUID = re.compile(r"((?<![0-9A-Za-z])[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}(?![0-9A-Za-z]))")
 _TRACEBACK_FORMATTER: Final = logging.Formatter()
 
 
@@ -26,8 +28,14 @@ def redact_pii(text: str) -> str:
     """Mask PII and card data in free text. A mask never matches again, so redacting twice is harmless.
 
     Emails and UPI ids keep their first character and domain ("r****@gmail.com"); card and phone numbers
-    keep their last four digits; cvv values become "***".
+    keep their last four digits; cvv values become "***". UUIDs, the ids services log (LLD §2.8), are kept
+    whole: a UUIDv7 starts with a millisecond timestamp, whose digits would otherwise pass for a card number.
     """
+    parts = _UUID.split(text)
+    return "".join(part if index % 2 else _redact(part) for index, part in enumerate(parts))
+
+
+def _redact(text: str) -> str:
     text = _CVV.sub(r"\g<key>***", text)
     text = _EMAIL.sub(r"\g<first>****@\g<domain>", text)
     text = _CARD.sub(_mask_card, text)
