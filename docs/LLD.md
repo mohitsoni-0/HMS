@@ -93,9 +93,11 @@ booking/
 7. **Outcomes vs errors.** When a state change must persist and the client must still get a non-2xx (payment declined, booking expired), the service **returns** an outcome and the view answers with `api_response(data, http_status=..., status=...)`. Services never raise after a state change they need committed.
 8. **Logging.** `logger = logging.getLogger(__name__)`. Services log **ids only**, never commands or entities. Fields holding card data, PII or method details are declared `field(repr=False)`. `PiiRedactionFilter` is the safety net.
 9. **Time.** Inject a `Clock`. Timestamps are timezone-aware UTC; stay dates are `date`; check-in instants use `Asia/Kolkata`.
-10. **Money.** `Decimal`, 2 decimal places, `ROUND_HALF_UP`, INR. On the wire, money is always `{"amount": "<0.00>", "currency": "INR"}` (`MoneyField`).
-11. **Enums.** `hotel_commons.enum.Enum` with integer values, stored through `EnumField`. On the wire they appear as **member names** (`EnumNameField`), e.g. `"PREPAID"`.
-12. **Routes.** No trailing slashes anywhere (`APPEND_SLASH = False`). Path ids use `<uuid:...>` converters, so a malformed id gets a 404 envelope.
+10. **Money is integer paisa end to end.** `Money(paisa: int)` in the domain; `BIGINT *_paisa` columns in Postgres; no floats anywhere. Conversion happens **only** in the serializer: `HotelAmountField` deserialises rupees (`"4800.50"`) to `480050` and serialises paisa back to `"4800.50"`. Every rounding is `ROUND_HALF_UP` to a whole paisa. Response objects carry a sibling `currency: "INR"`.
+11. **Enums are `SMALLINT` in the database.** `hotel_commons.enum.Enum` with integer values, persisted by the model `EnumField` (int ↔ member). On the wire they are **member names**: `HotelEnumField(enum)` deserialises `"PREPAID"` to the member, serialises the member (or a raw int) to `"PREPAID"`, and rejects anything else listing the allowed names. The integer never leaks into the API, so reordering or renaming labels is safe.
+12. **Serializers use the custom `Hotel*Field` classes (§3.14) — never bare DRF fields.** Field-level security is declared on the field (`restrict_roles=[Role.ADMIN]`, `read_roles`, `subject_attr`, `mask_as`), exactly as the reference LOS serializers declare `restrict_roles` on `Kuhoo*Field`s.
+13. **One database, one schema per context (§3.15).** Every `db_table` is `schema_table("<context>", "<table>")`.
+14. **Routes.** No trailing slashes anywhere (`APPEND_SLASH = False`). Path ids use `<uuid:...>` converters, so a malformed id gets a 404 envelope.
 
 ## 3. Shared library — `hotel_commons`
 
@@ -111,7 +113,8 @@ hotel_commons/
 ├── exceptions.py            # AppError hierarchy (no Django imports)
 ├── context.py               # RequestContext over ContextVars
 ├── domain/                  # money.py, date_range.py, clock.py, unit_of_work.py
-├── db/unit_of_work.py       # DjangoUnitOfWork
+├── db/                      # unit_of_work.py (DjangoUnitOfWork), schema.py (schema_table, create_schema_operation)
+├── serializers/             # fields.py (Hotel*Field), base.py (BaseHotelSerializer, BaseHotelModelSerializer)
 ├── models/                  # base.py, managers.py, log_model.py, fields.py, pii_companions.py
 ├── security/                # __init__.py (EMPTY, no re-exports), principal.py, pi_type.py, pii.py,
 │                            # jwt_tokens.py, api_crypto.py, idor.py, field_level.py, permissions.py, client_ip.py
@@ -232,16 +235,21 @@ class RequestContext:
 # hotel_commons/domain/money.py
 @dataclass(frozen=True, slots=True)
 class Money:
-    amount: Decimal
+    paisa: int                       # minor units: ₹ × 100. int only (bool rejected); may be 0, never negative
     currency: str = "INR"
-    # __post_init__: quantize 0.01 ROUND_HALF_UP; currency must be "INR" -> else ValidationFailed(VALIDATION_FAILED, errors={"currency": ...})
+    # __post_init__: type/sign checks; currency must be "INR" -> else ValidationFailed(VALIDATION_FAILED, errors={...})
     @classmethod
     def zero(cls, currency: str = "INR") -> "Money": ...
+    @classmethod
+    def of_rupees(cls, rupees: Decimal | str | int) -> "Money": ...
+    # Decimal(str(x)); more than 2 decimal places, NaN or negative -> ValidationFailed
+    @property
+    def rupees(self) -> Decimal: ...                         # Decimal(paisa) / 100, quantized 0.01
     def __add__(self, other: "Money") -> "Money": ...
     def __sub__(self, other: "Money") -> "Money": ...
-    def times(self, factor: int | Decimal) -> "Money": ...
-    def percent(self, pct: Decimal) -> "Money": ...          # pct in 0..100
-    def divide(self, n: int) -> "Money": ...
+    def times(self, factor: int | Decimal) -> "Money": ...   # paisa × factor, ROUND_HALF_UP to a whole paisa
+    def percent(self, pct: Decimal) -> "Money": ...          # pct in 0..100, ROUND_HALF_UP
+    def divide(self, n: int) -> "Money": ...                 # ROUND_HALF_UP (used for per-night averages)
     def is_positive(self) -> bool: ...
     # ordering (<, <=, >, >=) within a currency
 
@@ -356,8 +364,8 @@ class ActiveQuerySetManager(models.Manager.from_queryset(CustomUpdateManager)):
 
 **Model triad rules**:
 1. `CommonX(AddCommonField)` is abstract and holds only the business columns. FKs declared in `CommonX` use `related_name="+"`.
-2. `X(CommonX)` calls `CustomUpdateManager.set_logModel(logModel="app.XLog", model="app.X")` in its class body. It declares `db_table`, indexes and constraints, and overrides an FK when a reverse accessor is needed.
-3. `XLog(CommonX)` adds `log = models.ForeignKey("app.X", on_delete=models.RESTRICT, related_name="logs")`, sets `updation_date = None` and `updation_by = None`, and uses `db_table = "<x>_log"`.
+2. `X(CommonX)` calls `CustomUpdateManager.set_logModel(logModel="app.XLog", model="app.X")` in its class body. It declares `db_table = schema_table("<schema>", "<x>")`, indexes and constraints, and overrides an FK when a reverse accessor is needed.
+3. `XLog(CommonX)` adds `log = models.ForeignKey("app.X", on_delete=models.RESTRICT, related_name="logs")`, sets `updation_date = None` and `updation_by = None`, and uses `db_table = schema_table("<schema>", "<x>_log")` (§3.15).
 4. Unique constraints and indexes live on concrete classes only, so snapshots never collide.
 5. `id = models.UUIDField(primary_key=True, default=uuid7, editable=False)` is declared in `CommonX` (`from uuid6 import uuid7`). Log rows get a fresh id.
 
@@ -373,7 +381,7 @@ class CommonBooking(AddCommonField):
 class Booking(CommonBooking):
     CustomUpdateManager.set_logModel(logModel="booking.BookingLog", model="booking.Booking")
     class Meta:
-        db_table = "booking_booking"
+        db_table = schema_table("booking", "booking")      # -> 'booking"."booking'
         constraints = [models.CheckConstraint(condition=Q(check_out__gt=F("check_in")), name="booking_dates_valid")]
 
 class BookingLog(CommonBooking):
@@ -381,7 +389,7 @@ class BookingLog(CommonBooking):
     updation_date = None
     updation_by = None
     class Meta:
-        db_table = "booking_booking_log"
+        db_table = schema_table("booking", "booking_log")
         indexes = [models.Index(fields=["log", "creation_date"])]
 ```
 
@@ -547,21 +555,15 @@ class IdorGuard:
 ```
 
 ```python
-# hotel_commons/security/field_level.py
-@dataclass(frozen=True, slots=True)
-class FieldPolicy:
-    write_roles: frozenset[Role] | None = None     # None = anyone may send it
-    read_roles: frozenset[Role] | None = None      # None = everyone sees it
-    subject_attr: str | None = None                # the data subject (attr on the serialized object) also sees it
-    mask_as: PiType | None = None                  # not readable -> mask (if set) else drop the key
-
-class FieldLevelSecurityMixin:                     # mix into a rest_framework Serializer
-    # class Meta: field_policies: Mapping[str, FieldPolicy]
+# hotel_commons/security/field_level.py — the engine behind the field kwargs of §3.14
+class FieldLevelSecurityMixin:                     # mixed into BaseHotelSerializer / BaseHotelModelSerializer
     def to_internal_value(self, data): ...
-    # any field present in data whose write_roles miss the caller -> Forbidden(FIELD_ACCESS_DENIED, field=name)
+    # for every field present in `data` (recursing into nested serializers and list children):
+    # field.restrict_roles non-empty and caller has none of them -> Forbidden(FIELD_ACCESS_DENIED, field=<dotted name>)
     def to_representation(self, instance): ...
-    # readable = read_roles is None or caller has a read role or (subject_attr and caller.user_id ==
-    # str(getattr(instance, subject_attr))); else mask or drop
+    # per field: readable = not field.read_roles or caller has one of them
+    #            or (field.subject_attr and caller.user_id == str(getattr(instance, field.subject_attr)))
+    # not readable -> Masker.mask(value, field.mask_as) if mask_as else the key is dropped
     # principal: self.context["request"].principal, else RequestContext.principal()
 ```
 
@@ -625,10 +627,7 @@ class BaseViewSet(GenericViewSet):
     # perform_authentication -> check_throttles -> check_permissions -> IdorGuard().check(...)
     def finalize_response(self, request, response, *args, **kwargs): ...   # X-RateLimit-Limit / -Remaining
 
-# hotel_commons/api/fields.py
-class MoneyField(serializers.Field): ...        # Money <-> {"amount": "0.00", "currency": "INR"}
-class EnumNameField(serializers.ChoiceField):   # member name on the wire, enum member in Python
-    def __init__(self, enum_cls: type[Enum], **kwargs): ...
+# serializer fields live in hotel_commons/serializers/ (§3.14)
 
 # hotel_commons/api/pagination.py
 @dataclass(frozen=True) class PageRequest: page: int = 1; page_size: int = 20     # page_size max 50
@@ -813,6 +812,133 @@ event_bus = InProcessEventBus()
 - **`management/commands/mint_token.py`**: `python manage.py mint_token --sub guest-1 --roles GUEST [--ttl 3600]`.
 - **`testing/`**: `FixedClock`, `NoopUnitOfWork`, `RecordingEventPublisher`, `InMemoryIdempotencyStore`, `InMemoryRateLimiter`, `make_token(user_id, *roles)`, `auth_header(user_id, *roles)`.
 
+### 3.14 Custom serializer fields (`hotel_commons/serializers/`)
+
+Same idea as the reference `kuhoo.serializers.fields` (`KuhooIntegerField(restrict_roles=[ADMIN])`, `EnumField(enum, label_name="name")`, `KuhooAmountField`): every serializer field is a `Hotel*Field`, carries its own access rule, and owns its wire ↔ internal conversion.
+
+```python
+# hotel_commons/serializers/fields.py
+class HotelFieldMixin:
+    """Common kwargs for every Hotel*Field:
+       restrict_roles: Sequence[Role] = ()   roles allowed to SEND the field (empty = anyone)  -> 403 otherwise
+       read_roles:     Sequence[Role] = ()   roles allowed to SEE the raw value (empty = everyone)
+       subject_attr:   str | None = None     attribute on the serialised object naming the data subject,
+                                             who may always see their own value (e.g. "guest_id")
+       mask_as:        PiType | None = None  when not readable: mask with Masker, else drop the key
+       help_text is extended with the access rule (like kuhoo's help_text_for_access_role)."""
+
+class HotelCharField(HotelFieldMixin, serializers.CharField): ...          # trims; max_length enforced
+class HotelIntegerField(HotelFieldMixin, serializers.IntegerField): ...    # rejects bool and floats
+class HotelBooleanField(HotelFieldMixin, serializers.BooleanField): ...
+class HotelUUIDField(HotelFieldMixin, serializers.UUIDField): ...
+class HotelDateField(HotelFieldMixin, serializers.DateField): ...          # "YYYY-MM-DD" only
+class HotelDateTimeField(HotelFieldMixin, serializers.DateTimeField): ...  # ISO-8601 with offset (UTC out)
+class HotelTimeField(HotelFieldMixin, serializers.TimeField): ...          # "HH:MM"
+class HotelEmailField(HotelFieldMixin, serializers.EmailField): ...        # lower-cased
+class HotelPhoneField(HotelCharField): ...                                 # ^[6-9]\d{9}$
+class HotelListField(HotelFieldMixin, serializers.ListField): ...
+class HotelCsvListField(HotelListField): ...                               # query param "WIFI,POOL" -> ["WIFI", "POOL"]
+
+class HotelEnumField(HotelFieldMixin, serializers.Field):
+    """Enum converter. DB: SMALLINT via model EnumField. Wire: member name."""
+    def __init__(self, enum: type[Enum], *, label_name: str = "name", **kwargs): ...
+    def to_internal_value(self, data) -> Enum: ...
+    # str name -> member; anything else (including ints) ->
+    # ValidationFailed(VALIDATION_FAILED, errors={field: "must be one of A, B, C"})
+    def to_representation(self, value: Enum | int) -> str: ...   # member or raw int -> getattr(member, label_name)
+    # help_text "One of: A, B, C"; OpenAPI enum emitted through @extend_schema_field
+
+class HotelAmountField(HotelFieldMixin, serializers.Field):
+    """Money converter. DB and domain: integer paisa. Wire: rupees as a 2-dp string."""
+    def __init__(self, *, min_rupees: Decimal | None = None, max_rupees: Decimal | None = None, **kwargs): ...
+    def to_internal_value(self, data) -> int: ...
+    # "4800.5" | "4800.50" | 4800 | Decimal -> 480050 via Decimal(str(data)) * 100. Floats are converted through
+    # str(), never binary; > 2 dp, negative, NaN/inf or out of range -> ValidationFailed with the field name
+    def to_representation(self, value: int | Money) -> str: ...  # 480050 or Money(480050) -> "4800.50"
+
+class HotelEncryptedCharField(HotelCharField):
+    """PII field. mask_as is required. Never logs the value; masked on output unless the read rule passes."""
+
+# hotel_commons/serializers/base.py
+class BaseHotelSerializer(FieldLevelSecurityMixin, serializers.Serializer): ...
+class BaseHotelModelSerializer(FieldLevelSecurityMixin, serializers.ModelSerializer): ...
+# Every request/response serializer extends one of these. Views pass context={"request": request}.
+```
+
+Usage (booking):
+
+```python
+class BookingCreateSerializer(BaseHotelSerializer):
+    room_type_id = HotelUUIDField()
+    check_in = HotelDateField()
+    check_out = HotelDateField()
+    rooms = HotelIntegerField(min_value=1, max_value=10, default=1)
+    guests = HotelIntegerField(min_value=1, max_value=40)
+    booking_type = HotelEnumField(BookingType, default=BookingType.PREPAID)
+    guest_name = HotelEncryptedCharField(min_length=2, max_length=100, mask_as=PiType.NAME)
+    guest_email = HotelEmailField()
+    guest_phone = HotelPhoneField()
+    on_behalf_of_user_id = HotelCharField(required=False, max_length=64, restrict_roles=[Role.ADMIN])
+
+class BookingSerializer(BaseHotelSerializer):
+    booking_id = HotelUUIDField(source="id")
+    status = HotelEnumField(BookingStatus)
+    total_amount = HotelAmountField(source="price.total")
+    currency = HotelCharField(source="price.total.currency")
+    guest_email = HotelEncryptedCharField(source="contact.email", read_roles=[Role.ADMIN],
+                                          subject_attr="guest_id", mask_as=PiType.EMAIL)
+    # ...
+```
+
+### 3.15 Database: one PostgreSQL database, one schema per bounded context
+
+**Layout.** A single PostgreSQL 18 database, `hotel`, with one schema per context:
+
+| Schema | Tables |
+|---|---|
+| `catalog` | owner_account (+log), property (+log), room_type (+log), amenity |
+| `inventory` | allotment, room_night, hold (+log) |
+| `discovery` | listing |
+| `booking` | booking (+log) |
+| `payment` | payment (+log), refund (+log) |
+| `public` | Django internals only (migrations, contenttypes, auth) |
+
+`pricing` owns no tables.
+
+```python
+# hotel_commons/db/schema.py
+def schema_table(schema: str, table: str) -> str:
+    """db_table value that Django quotes as "schema"."table" on PostgreSQL."""
+    return f'{schema}"."{table}'
+
+def create_schema_operation(schema: str) -> migrations.RunSQL:
+    return migrations.RunSQL(f'CREATE SCHEMA IF NOT EXISTS "{schema}"', reverse_sql=migrations.RunSQL.noop)
+```
+
+- Each app's `0001_initial` migration begins with `create_schema_operation("<schema>")`; tables are created schema-qualified.
+- Tests run migrations (no `--nomigrations`), so test databases get the schemas too.
+- Index and constraint names are explicit and prefixed with the table, e.g. `booking_booking_status_hold_idx`.
+
+**Why schemas, and why one connection.**
+- A schema is the ownership boundary of a context and the unit of a future split: `pg_dump --schema=booking` moves it to its own database. There are no cross-schema foreign keys, so nothing has to be untangled.
+- All schemas are reached through the single `default` alias, i.e. one connection per request. Cross-context use cases (create booking → hold inventory; pay → charge → confirm hold) therefore stay **one ACID transaction**.
+- One Django alias per schema was rejected: Django transactions are per alias, so that would silently turn every cross-context use case into an unprotected distributed transaction.
+- In production each context gets its own database role with `USAGE`/`CREATE` on its schema only (least privilege); the monolith's role is granted all of them. After a split, a service keeps its role and simply connects to its own database.
+
+**Scalability built into the schema.**
+
+| Concern | Decision |
+|---|---|
+| Keys | UUIDv7 primary keys: time-ordered (B-tree inserts stay right-leaning), globally unique (merge/shard friendly), unguessable |
+| Types | Money `BIGINT` paisa; enums `SMALLINT` with `db_comment` listing values; dates `DATE`; instants `TIMESTAMPTZ` |
+| Hot rows | `inventory.room_night` has one row per room type per night, so contention only happens on the same room type and night. The table uses `fillfactor = 80` so `reserved_rooms` updates stay HOT (no index churn), plus tighter autovacuum settings |
+| Fail fast | The connection sets `lock_timeout = 2s` and `statement_timeout = 5s` (`OPTIONS["options"]`), so a contended booking returns 409/503 quickly instead of queueing |
+| Audit growth | `*_log` tables are append-only with a BRIN index on `creation_date` (tiny, ideal for time-correlated data). When volume demands, they are range-partitioned monthly by `creation_date`; old partitions are detached and archived |
+| Inventory growth | `inventory.room_night` grows by 365 rows per room type per year. Its partition key is `stay_date` (monthly ranges, past months archived); the unique key `(room_type_id, stay_date)` already contains it |
+| Search reads | `discovery.listing` is a denormalised read model with a composite `(city_key, is_active)` index and GIN on `amenity_codes`. It can be served from a read replica (`DATABASE_REPLICA_*` + a router for the discovery app) or moved to OpenSearch without touching writers |
+| Connections | `CONN_MAX_AGE = 60` + health checks locally; PgBouncer (transaction pooling) or Django's psycopg pool in production |
+| Integrity in the DB | CHECKs (counters, dates, ratings, amounts > 0), UNIQUEs (idempotency keys, room-type names, contact-email hash), partial index for pending holds — invariants hold even if application code is wrong |
+
 ## 4. `catalog` app — properties and owners (module 01)
 
 ### 4.1 Enums (`catalog/public/enums.py`, re-exported by `catalog/enums.py`)
@@ -962,7 +1088,7 @@ def get_catalog_api() -> CatalogAPI: ...
 
 ### 4.6 Tables
 
-**`catalog_owner_account`** and `catalog_owner_account_log`
+**`catalog.owner_account`** and `catalog.owner_account_log`
 
 | Column | Type | Notes |
 |---|---|---|
@@ -976,12 +1102,12 @@ def get_catalog_api() -> CatalogAPI: ...
 | masked_contact_phone | varchar(255) | |
 | + common fields | | |
 
-**`catalog_property`** and `catalog_property_log`
+**`catalog.property`** and `catalog.property_log`
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid PK | |
-| owner_account | uuid FK → catalog_owner_account | RESTRICT; indexed |
+| owner_account | uuid FK → catalog.owner_account | RESTRICT; indexed |
 | name, description | varchar(200), text | |
 | property_type | smallint | EnumField |
 | star_rating | smallint null | CHECK 1–5 |
@@ -992,21 +1118,21 @@ def get_catalog_api() -> CatalogAPI: ...
 | check_in_time, check_out_time | time | default 14:00 / 11:00 |
 | + common fields | | |
 
-**`catalog_room_type`** and `catalog_room_type_log`
+**`catalog.room_type`** and `catalog.room_type_log`
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid PK | |
-| property | uuid FK → catalog_property | RESTRICT |
+| property | uuid FK → catalog.property | RESTRICT |
 | name, description | varchar(120), text | UNIQUE (property, Lower(name)) on the live table |
 | max_occupancy | smallint | CHECK 1–10 |
 | total_rooms | smallint | CHECK ≥ 1 |
-| base_price | numeric(12,2) | CHECK > 0 |
+| base_price_paisa | bigint | CHECK > 0 (₹ × 100) |
 | currency | char(3) | 'INR' |
 | amenity_codes | varchar(40)[] | |
 | + common fields | | |
 
-**`catalog_amenity`** (no log): `code varchar(40) PK`, `name varchar(100)`, `category smallint`, + common fields. Seeded by `0002_seed_amenities` with WIFI, PARKING, POOL, GYM, SPA, RESTAURANT, BREAKFAST, AIR_CONDITIONING, PET_FRIENDLY, AIRPORT_SHUTTLE, TV, MINIBAR, BALCONY, KITCHEN.
+**`catalog.amenity`** (no log): `code varchar(40) PK`, `name varchar(100)`, `category smallint`, + common fields. Seeded by `0002_seed_amenities` with WIFI, PARKING, POOL, GYM, SPA, RESTAURANT, BREAKFAST, AIR_CONDITIONING, PET_FRIENDLY, AIRPORT_SHUTTLE, TV, MINIBAR, BALCONY, KITCHEN.
 
 ### 4.7 IDOR resolvers (`CatalogConfig.ready()`)
 
@@ -1116,9 +1242,9 @@ class HoldRepository(ABC):
 
 | Table | Columns | Constraints |
 |---|---|---|
-| `inventory_allotment` (no log) | `room_type_id uuid PK`, `total_rooms integer`, + common fields | CHECK total_rooms ≥ 0 |
-| `inventory_room_night` (no log) | `id uuid PK`, `room_type_id uuid`, `stay_date date`, `total_rooms integer`, `reserved_rooms integer default 0`, + common fields | UNIQUE (room_type_id, stay_date); CHECK `reserved_rooms >= 0 AND reserved_rooms <= total_rooms` |
-| `inventory_hold` + `inventory_hold_log` | `id uuid PK`, `room_type_id uuid`, `check_in date`, `check_out date`, `rooms smallint`, `reference varchar(64)` (indexed), `hold_status smallint`, `expires_at timestamptz null`, `release_reason smallint null`, `released_at timestamptz null`, + common fields | CHECK check_out > check_in; CHECK rooms ≥ 1 |
+| `inventory.allotment` (no log) | `room_type_id uuid PK`, `total_rooms integer`, + common fields | CHECK total_rooms ≥ 0 |
+| `inventory.room_night` (no log) | `id uuid PK`, `room_type_id uuid`, `stay_date date`, `total_rooms integer`, `reserved_rooms integer default 0`, + common fields | UNIQUE (room_type_id, stay_date); CHECK `reserved_rooms >= 0 AND reserved_rooms <= total_rooms` |
+| `inventory.hold` + `inventory.hold_log` | `id uuid PK`, `room_type_id uuid`, `check_in date`, `check_out date`, `rooms smallint`, `reference varchar(64)` (indexed), `hold_status smallint`, `expires_at timestamptz null`, `release_reason smallint null`, `released_at timestamptz null`, + common fields | CHECK check_out > check_in; CHECK rooms ≥ 1 |
 
 ### 5.7 Status codes (2102xxx)
 
@@ -1210,7 +1336,7 @@ class SortOrder(Enum):
 @dataclass(frozen=True, slots=True)
 class SearchCriteria:
     city: str; stay: DateRange; guests: int; rooms: int = 1; locality: str | None = None
-    min_price: Money | None = None; max_price: Money | None = None
+    min_price: Amount | None = None; max_price: Amount | None = None
     amenities: frozenset[str] = frozenset(); min_star_rating: int | None = None
     property_types: frozenset[PropertyType] = frozenset()
     sort: SortOrder = SortOrder.PRICE_LOW_TO_HIGH; page: int = 1; page_size: int = 20
@@ -1305,9 +1431,9 @@ class QuotePort(ABC):
   4. OFFER filters → group by property → sort → paginate.
 - `ListingProjector(listings)`: `on_property_onboarded(event)` and `on_room_type_added(event)` map the `PropertySnapshot` to `Listing` rows and call `upsert_many`. They are subscribed to `event_bus` in `DiscoveryConfig.ready()`.
 
-### 7.3 Table — `discovery_listing` (projection, no log)
+### 7.3 Table — `discovery.listing` (projection, no log)
 
-`room_type_id uuid PK`, `property_id uuid` (indexed), `property_name`, `property_type smallint`, `star_rating smallint null`, `city`, `city_key`, `locality`, `amenity_codes varchar(40)[]` (GIN index), `room_type_name`, `max_occupancy smallint`, `base_price numeric(12,2)`, `currency`, `pricing_strategy smallint`, `is_active bool`, + common fields. Composite index on `(city_key, is_active)`.
+`room_type_id uuid PK`, `property_id uuid` (indexed), `property_name`, `property_type smallint`, `star_rating smallint null`, `city`, `city_key`, `locality`, `amenity_codes varchar(40)[]` (GIN index), `room_type_name`, `max_occupancy smallint`, `base_price_paisa bigint`, `currency`, `pricing_strategy smallint`, `is_active bool`, + common fields. Composite index on `(city_key, is_active)`.
 
 Status code: `2104001 INVALID_SEARCH "{reason}"` (400).
 
@@ -1348,7 +1474,7 @@ class Booking:
     contact: GuestContact; created_at: datetime
     hold_id: UUID | None = None; hold_expires_at: datetime | None = None
     payment_id: UUID | None = None; last_payment_failure: str | None = None
-    refund_amount: Money | None = None; refund_percent: Decimal | None = None
+    refund_amount: Amount | None = None; refund_percent: Decimal | None = None
     refund_status: BookingRefundStatus = BookingRefundStatus.NONE; refund_id: UUID | None = None
     cancellation_reason: str | None = None
     confirmed_at: datetime | None = None; cancelled_at: datetime | None = None; expired_at: datetime | None = None
@@ -1420,7 +1546,7 @@ class RefundTier:
 class CancellationPolicy(ABC):
     code: CancellationPolicyCode
     @abstractmethod
-    def evaluate(self, *, amount_paid: Money, check_in_at: datetime, cancelled_at: datetime) -> RefundDecision: ...
+    def evaluate(self, *, amount_paid: Amount, check_in_at: datetime, cancelled_at: datetime) -> RefundDecision: ...
 
 class TieredCancellationPolicy(CancellationPolicy):
     def __init__(self, code: CancellationPolicyCode, tiers: Sequence[RefundTier]): ...
@@ -1573,7 +1699,7 @@ with uow:
 
 `booking` → `Ownership(guest_user_ids={booking.guest_id}, owner_user_ids={CatalogAPI.owner_user_id(booking.owner_account_id)})`.
 
-### 8.7 Table — `booking_booking` and `booking_booking_log`
+### 8.7 Table — `booking.booking` and `booking.booking_log`
 
 | Column | Type | Notes |
 |---|---|---|
@@ -1583,9 +1709,9 @@ with uow:
 | check_in, check_out | date | CHECK check_out > check_in |
 | rooms, guests | smallint | CHECK ≥ 1 |
 | booking_type, booking_status | smallint | EnumField |
-| total_amount | numeric(12,2) | |
+| total_amount_paisa | bigint | ₹ × 100 |
 | currency | char(3) | |
-| nightly_rates | jsonb | `JSONField(encoder=DjangoJSONEncoder)`: `[{"date": "2026-11-20", "amount": "4800.00"}]` |
+| nightly_rates | jsonb | `JSONField(encoder=DjangoJSONEncoder)`: `[{"date": "2026-11-20", "amount_paisa": 480000}]` |
 | pricing_strategy, cancellation_policy | smallint | snapshots |
 | check_in_time | time | snapshot |
 | guest_name / masked_guest_name | text / varchar(255) | `EncryptedTextField(pi_type=NAME)` |
@@ -1595,7 +1721,7 @@ with uow:
 | hold_expires_at | timestamptz null | partial index `WHERE booking_status = 1` |
 | payment_id, refund_id | uuid null | |
 | last_payment_failure | varchar(255) null | |
-| refund_amount | numeric(12,2) null | |
+| refund_amount_paisa | bigint null | ₹ × 100 |
 | refund_percent | numeric(5,2) null | |
 | refund_status | smallint | |
 | cancellation_reason | varchar(255) null | |
@@ -1793,14 +1919,14 @@ def get_payment_api() -> PaymentAPI: ...
 
 ### 9.7 Tables
 
-**`payment_payment`** and `payment_payment_log`
+**`payment.payment`** and `payment.payment_log`
 
 | Column | Type | Notes |
 |---|---|---|
 | id | uuid PK | |
 | booking_id | uuid | indexed; no FK |
 | payer_id | varchar(64) | |
-| amount, refunded_amount | numeric(12,2) | |
+| amount_paisa, refunded_amount_paisa | bigint | ₹ × 100 |
 | currency | char(3) | |
 | method, payment_status | smallint | EnumField |
 | instrument_display | varchar(64) | masked |
@@ -1810,12 +1936,12 @@ def get_payment_api() -> PaymentAPI: ...
 | idempotency_key | varchar(200) | UNIQUE on the live table |
 | + common fields | | |
 
-**`payment_refund`** and `payment_refund_log`: `id`, `payment` FK → payment_payment (RESTRICT), `amount`, `currency`, `refund_status`, `reason`, `gateway_refund_id`, `idempotency_key` (UNIQUE on the live table), + common fields.
+**`payment.refund`** and `payment.refund_log`: `id`, `payment` FK → payment.payment (RESTRICT), `amount_paisa bigint`, `currency`, `refund_status`, `reason`, `gateway_refund_id`, `idempotency_key` (UNIQUE on the live table), + common fields.
 
 ### 9.8 IDOR and field policy
 
 - `payment` → `Ownership(guest_user_ids={payment.payer_id})`, registered in `PaymentConfig.ready()`.
-- `PaymentSerializer.Meta.field_policies = {"gateway_txn_id": FieldPolicy(read_roles=frozenset({Role.ADMIN}))}`.
+- `PaymentSerializer.gateway_txn_id = HotelCharField(read_roles=[Role.ADMIN])` — dropped from the response for everyone else.
 
 ### 9.9 Status codes (2106xxx)
 
@@ -1879,26 +2005,28 @@ Notation: IDOR `resource/key/source/relations`. All bodies are JSON. Responses u
 
 ### 10.3 Serializers (fields; `→` marks output-only)
 
+All serializers extend `BaseHotelSerializer` and use `Hotel*Field`s (§3.14). Amounts are `HotelAmountField` (rupee strings on the wire, paisa inside) with a sibling `currency`. Enums are `HotelEnumField` (names on the wire, SMALLINT in the DB).
+
 | Serializer | Fields |
 |---|---|
-| `DevTokenRequestSerializer` | `user_id` str ^[A-Za-z0-9_.@-]{1,64}$, `roles` list[EnumName Role] (min 1) |
+| `DevTokenRequestSerializer` | `user_id` str ^[A-Za-z0-9_.@-]{1,64}$, `roles` list[HotelEnumField(Role)] (min 1) |
 | `AmenitySerializer` | → `code`, `name`, `category` |
 | `OwnerAccountCreateSerializer` | `display_name` str 2–200, `contact_email` email, `contact_phone` ^[6-9]\d{9}$ |
-| `OwnerAccountSerializer` (FieldLevelSecurity) | → `account_id`, `display_name`, `owner_user_id`, `contact_email`, `contact_phone`, `created_at`. Policies: both contact fields `FieldPolicy(read_roles={ADMIN}, subject_attr="owner_user_id", mask_as=EMAIL/PHONE)` |
+| `OwnerAccountSerializer` | → `account_id`, `display_name`, `owner_user_id`, `contact_email`, `contact_phone`, `created_at`. Contact fields are `HotelEncryptedCharField(read_roles=[ADMIN], subject_attr="owner_user_id", mask_as=EMAIL/PHONE)` |
 | `AddressSerializer` | `line1`, `locality`, `city`, `state`, `postal_code` (^\d{6}$), `country` (default "IN") |
-| `RoomTypeCreateSerializer` | `name` 2–120, `description` opt, `max_occupancy` 1–10, `total_rooms` 1–500, `base_price` decimal > 0 (2 dp), `amenities` list[str] (default []) |
-| `PropertyOnboardSerializer` | `name`, `description` opt, `property_type` EnumName, `star_rating` 1–5 opt, `address` AddressSerializer, `amenities` list[str], `pricing_strategy` EnumName (default STANDARD), `cancellation_policy` EnumName (default MODERATE), `check_in_time` (default 14:00), `check_out_time` (default 11:00), `room_types` list[RoomTypeCreateSerializer] (min 1) |
-| `RoomTypeSerializer` | → `room_type_id`, `name`, `description`, `max_occupancy`, `total_rooms`, `base_price` Money, `amenities`, `is_active` |
+| `RoomTypeCreateSerializer` | `name` 2–120, `description` opt, `max_occupancy` 1–10, `total_rooms` 1–500, `base_price` HotelAmountField(min=1) — rupees in, paisa out, `amenities` list[str] (default []) |
+| `PropertyOnboardSerializer` | `name`, `description` opt, `property_type` HotelEnumField, `star_rating` 1–5 opt, `address` AddressSerializer, `amenities` list[str], `pricing_strategy` HotelEnumField (default STANDARD), `cancellation_policy` HotelEnumField (default MODERATE), `check_in_time` (default 14:00), `check_out_time` (default 11:00), `room_types` list[RoomTypeCreateSerializer] (min 1) |
+| `RoomTypeSerializer` | → `room_type_id`, `name`, `description`, `max_occupancy`, `total_rooms`, `base_price` Amount, `amenities`, `is_active` |
 | `PropertySerializer` | → `property_id`, `owner_account_id`, `name`, `description`, `property_type`, `star_rating`, `address`, `amenities`, `pricing_strategy`, `cancellation_policy`, `check_in_time`, `check_out_time`, `is_active`, `room_types` |
-| `SearchQuerySerializer` | `city` req, `check_in` date req, `check_out` date req (> check_in, ≤ MAX_STAY_NIGHTS), `guests` 1–40 req, `rooms` 1–10 (1), `locality`, `min_price`/`max_price` decimal ≥ 0 (min ≤ max), `amenities` comma list, `min_rating` 1–5, `property_types` comma EnumNames, `sort` price_asc\|price_desc\|rating_desc, `page` ≥ 1, `page_size` 1–50 (20) |
-| `SearchPageSerializer` | → `items[]{property_id, name, property_type, star_rating, city, locality, amenities, lowest_nightly_price Money, offers[]{room_type_id, room_type, max_occupancy, available_rooms, pricing_strategy, nightly_rates[]{date, price Money}, total Money, average_nightly Money}}`, `page`, `page_size`, `total` |
-| `BookingCreateSerializer` (FieldLevelSecurity) | `room_type_id` uuid, `check_in`, `check_out` (> check_in, ≤ MAX_STAY_NIGHTS), `rooms` 1–10 (1), `guests` ≥ 1, `booking_type` EnumName (PREPAID), `guest_name` 2–100, `guest_email` email, `guest_phone` ^[6-9]\d{9}$, `on_behalf_of_user_id` opt. Policy: `on_behalf_of_user_id` `FieldPolicy(write_roles={ADMIN})` |
+| `SearchQuerySerializer` | `city` req, `check_in` date req, `check_out` date req (> check_in, ≤ MAX_STAY_NIGHTS), `guests` 1–40 req, `rooms` 1–10 (1), `locality`, `min_price`/`max_price` HotelAmountField(min=0) (min ≤ max), `amenities` comma list, `min_rating` 1–5, `property_types` comma EnumNames, `sort` price_asc\|price_desc\|rating_desc, `page` ≥ 1, `page_size` 1–50 (20) |
+| `SearchPageSerializer` | → `items[]{property_id, name, property_type, star_rating, city, locality, amenities, lowest_nightly_price Amount, offers[]{room_type_id, room_type, max_occupancy, available_rooms, pricing_strategy, nightly_rates[]{date, price Amount}, total Amount, average_nightly Amount}}`, `page`, `page_size`, `total` |
+| `BookingCreateSerializer` | `room_type_id` uuid, `check_in`, `check_out` (> check_in, ≤ MAX_STAY_NIGHTS), `rooms` 1–10 (1), `guests` ≥ 1, `booking_type` HotelEnumField (PREPAID), `guest_name` 2–100, `guest_email` email, `guest_phone` ^[6-9]\d{9}$, `on_behalf_of_user_id` opt. `on_behalf_of_user_id` is `HotelCharField(restrict_roles=[ADMIN])` (403 for anyone else) |
 | `BookingListQuerySerializer` | `property_id` uuid opt, `guest_id` opt (ADMIN), `page`, `page_size` |
-| `BookingSerializer` (FieldLevelSecurity) | → `booking_id`, `status`, `booking_type`, `property_id`, `room_type_id`, `check_in`, `check_out`, `nights`, `rooms`, `guests`, `total` Money, `nightly_rates[]{date, price}`, `pricing_strategy`, `cancellation_policy`, `hold_expires_at`, `payment_id`, `refund{amount Money, percent, status}`, `guest_name`, `guest_email`, `guest_phone`, `last_payment_failure`, `created_at`, `confirmed_at`, `cancelled_at`, `expired_at`. Policies: the three guest fields `FieldPolicy(read_roles={ADMIN}, subject_attr="guest_id", mask_as=NAME/EMAIL/PHONE)` |
-| `BookingPaymentSerializer` | `method` EnumName; exactly one of `card{card_number (write_only), expiry_month 1–12, expiry_year, cvv (write_only), holder_name}`, `upi{vpa}`, `wallet{provider EnumName, phone}`, matching `method` |
+| `BookingSerializer` | → `booking_id`, `status`, `booking_type`, `property_id`, `room_type_id`, `check_in`, `check_out`, `nights`, `rooms`, `guests`, `total` Amount, `nightly_rates[]{date, price}`, `pricing_strategy`, `cancellation_policy`, `hold_expires_at`, `payment_id`, `refund{amount Amount, percent, status}`, `guest_name`, `guest_email`, `guest_phone`, `last_payment_failure`, `created_at`, `confirmed_at`, `cancelled_at`, `expired_at`. The three guest fields are `HotelEncryptedCharField(read_roles=[ADMIN], subject_attr="guest_id", mask_as=NAME/EMAIL/PHONE)` |
+| `BookingPaymentSerializer` | `method` HotelEnumField; exactly one of `card{card_number (write_only), expiry_month 1–12, expiry_year, cvv (write_only), holder_name}`, `upi{vpa}`, `wallet{provider HotelEnumField, phone}`, matching `method` |
 | `PaymentSummarySerializer` | → `payment_id`, `status`, `instrument`, `failure_code`, `failure_message` |
 | `BookingCancelSerializer` | `reason` str ≤ 255 opt |
-| `PaymentSerializer` (FieldLevelSecurity) | → `payment_id`, `booking_id`, `amount` Money, `refunded_amount` Money, `status`, `method`, `instrument`, `failure_code`, `failure_message`, `gateway_txn_id` (ADMIN only) |
+| `PaymentSerializer` | → `payment_id`, `booking_id`, `amount` Amount, `refunded_amount` Amount, `status`, `method`, `instrument`, `failure_code`, `failure_message`, `gateway_txn_id` (ADMIN only) |
 
 ### 10.4 Examples
 
@@ -1912,13 +2040,13 @@ GET /hotel/v1/discovery/search?city=Goa&check_in=2026-11-20&check_out=2026-11-22
 {"status": 2100000, "message": "Success", "request_id": "7f9c…", "data": {
   "items": [{"property_id": "0192f5c4-…", "name": "Sea Breeze Resort", "property_type": "RESORT", "star_rating": 4,
              "city": "Goa", "locality": "Candolim", "amenities": ["BREAKFAST", "POOL", "WIFI"],
-             "lowest_nightly_price": {"amount": "4800.00", "currency": "INR"},
+             "lowest_nightly_price": "4800.00",
              "offers": [{"room_type_id": "0192f5c4-…", "room_type": "Deluxe Sea View", "max_occupancy": 2,
                          "available_rooms": 7, "pricing_strategy": "WEEKEND",
-                         "nightly_rates": [{"date": "2026-11-20", "price": {"amount": "4800.00", "currency": "INR"}},
-                                           {"date": "2026-11-21", "price": {"amount": "4800.00", "currency": "INR"}}],
-                         "total": {"amount": "9600.00", "currency": "INR"},
-                         "average_nightly": {"amount": "4800.00", "currency": "INR"}}]}],
+                         "nightly_rates": [{"date": "2026-11-20", "price": "4800.00"},
+                                           {"date": "2026-11-21", "price": "4800.00"}],
+                         "total": "9600.00",
+                         "average_nightly": "4800.00"}]}],
   "page": 1, "page_size": 20, "total": 1}}
 ```
 
@@ -1934,7 +2062,7 @@ Idempotency-Key: booking-6f1d2c7e-001
 ```
 
 Response `201`:
-- `data.status = "PENDING_PAYMENT"`, `data.total = {"amount": "9600.00", "currency": "INR"}`, `data.hold_expires_at = "…"`.
+- `data.status = "PENDING_PAYMENT"`, `data.total = "9600.00"`, `data.hold_expires_at = "…"`.
 - The guest sees their own contact in full; an OWNER sees `"guest_email": "r****@example.com"`.
 
 Pay:
@@ -1957,7 +2085,7 @@ Idempotency-Key: pay-0192f5c5-attempt-1
 
 Other methods: `{"method": "UPI", "upi": {"vpa": "rahul@okaxis"}}` · `{"method": "WALLET", "wallet": {"provider": "PAYTM", "phone": "9876543210"}}`.
 
-Cancel: `POST /hotel/v1/bookings/{id}/cancel` with `{"reason": "plans changed"}` → `200`, `data.status = "CANCELLED"`, `data.refund = {"amount": {"amount": "9600.00", "currency": "INR"}, "percent": "100.00", "status": "REFUNDED"}`.
+Cancel: `POST /hotel/v1/bookings/{id}/cancel` with `{"reason": "plans changed"}` → `200`, `data.status = "CANCELLED"`, `data.refund = {"amount": "9600.00", "percent": "100.00", "status": "REFUNDED"}`.
 
 Error body: `{"status": 2105002, "message": "Cannot pay a booking that is CANCELLED", "errors": null, "data": null, "request_id": "…"}`.
 

@@ -352,11 +352,14 @@ stateDiagram-v2
 
 ## 8. Data architecture
 
-### 8.1 Ownership
+### 8.1 One database, one schema per context
 
-- Each app owns its tables, prefixed with its label (`booking_booking`, `payment_refund`).
-- No foreign keys across apps — cross-context references are UUID columns — so each app's tables can move to their own database when split. Foreign keys inside an app are normal.
-- Primary keys are UUIDv7: time-ordered (good B-tree locality) and unguessable (a second layer against ID enumeration behind IDOR checks).
+- **Layout.** One PostgreSQL 18 database with one **schema per bounded context**: `catalog`, `inventory`, `discovery`, `booking`, `payment`. Tables are schema-qualified (`booking.booking`, `payment.refund`); Django internals stay in `public`.
+- **Single connection.** Every schema is reached through one connection, so cross-context use cases (book → hold inventory; pay → charge → confirm hold) remain a single ACID transaction. A Django alias per schema was rejected: transactions are per alias, so it would silently create distributed transactions.
+- **No foreign keys across schemas.** Cross-context references are UUID columns, so a schema can move to its own database (`pg_dump --schema=…`) when its app becomes a service. Foreign keys inside a schema are normal.
+- **Least privilege.** In production each context gets its own database role limited to its schema.
+- **Keys.** Primary keys are UUIDv7: time-ordered (good B-tree locality) and unguessable (a second layer against ID enumeration behind IDOR checks).
+- **Types.** Money is stored as **BIGINT paisa** (₹ × 100, no floating point anywhere). Enums are **SMALLINT** with a column comment listing their values. Serializers convert both at the API edge: rupee strings and enum names.
 
 ### 8.2 Common fields — `AddCommonField`
 
@@ -424,6 +427,16 @@ classDiagram
 | Idempotency | `hb:idem:v1:{scope}:{principal}:{key}` | encrypted record (state, HMAC fingerprint, response); 60 s in progress, 24 h completed |
 | Encrypted-payload replay guard | `hb:enc:v1:{sha256(wrapped key)}` | flag; 5 min |
 
+### 8.6 Scaling the data tier
+
+| Concern | Design |
+|---|---|
+| Hot inventory rows | One row per room type per night, so contention only arises on the same room type and night. `fillfactor = 80` keeps counter updates HOT; `lock_timeout = 2s` and `statement_timeout = 5s` make contention fail fast with 409/503 instead of queueing |
+| Growth | `*_log` tables are append-only with BRIN indexes on `creation_date`, range-partitioned monthly when volume demands, with old partitions detached and archived. `room_night` partitions by `stay_date` |
+| Reads | `discovery.listing` is a denormalised read model (GIN on amenities, composite city index), so it can be served from a read replica or replaced by a search engine without touching writers |
+| Connections | PgBouncer (transaction pooling) or Django's psycopg pool in production |
+| Invariants in the database | CHECK, UNIQUE and partial-index constraints guard counters, dates, amounts and idempotency keys even if application code is wrong |
+
 Redis is never the source of truth:
 - If it is down, rate limiting fails open, except for payments, which fail closed.
 - Idempotency falls back to Postgres: the payment table's unique key plus a durable replay check in the pay flow, so a payment still cannot be charged twice.
@@ -483,7 +496,9 @@ Alternatives considered:
 - Base path `/hotel/{API_VERSION}/` (default `v1`), JSON only, no trailing slashes. OpenAPI schema at `/hotel/v1/schema`, Swagger UI at `/hotel/v1/docs`.
 - Success envelope: `{"status": 2100000, "message": "Success", "data": {...}, "request_id": "..."}`. Error envelope: `{"status": 2105002, "message": "...", "errors": {...}, "data": null, "request_id": "..."}`. Real HTTP status codes are always used.
 - Outcome responses keep `data`: a declined payment (402) and an expired hold (409) return the current booking in `data`, because the state change was committed.
-- Money is always `{"amount": "9600.00", "currency": "INR"}`; enums are their names (`"PREPAID"`).
+- Custom serializer fields (`Hotel*Field`, like the reference `Kuhoo*Field`s) own every conversion and carry field-level access rules (`restrict_roles`, `read_roles`, `mask_as`).
+  - Amounts travel as rupee strings (`"9600.00"`) with a sibling `currency`, and are stored as integer paisa.
+  - Enums travel as names (`"PREPAID"`) and are stored as SMALLINT.
 - Status codes follow `SS MM EEE`: service `21`, module (`00` common, `01` catalog, `02` inventory, `03` pricing, `04` discovery, `05` booking, `06` payment), error number. Each app keeps its catalogue in `status_code.py`, as in the reference services.
 - HTTP mapping: 400 validation · 401 token · 402 payment declined · 403 role or field · 404 not found or not yours · 409 state conflict, no inventory, idempotent request in progress · 422 business rule or idempotency-key reuse · 429 rate limit · 500 unexpected.
 
