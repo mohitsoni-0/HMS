@@ -6,6 +6,8 @@
 
 **Architecture:** A modular monolith: one Django project with six apps (catalog, inventory, pricing, discovery, booking, payment), each split into domain, interfaces, services and adapters. Apps talk only through `<app>.public`. One database with one schema per app, all on a single connection. Cross-cutting code lives in the installable `libs/hotel-commons`.
 
+**Execution:** Phase A runs Tasks 0 and 1 in parallel (Task 1 split into 1-kernel and 1-models). Phase B runs Tasks 1b, 1c and 2–7 in parallel. Phase C is Task 8, integration. Agents never run git, makemigrations or migrate; integration owns migrations.
+
 **Tech Stack:** Python 3.12 (local venv) / 3.13 (container), Django 5.2, DRF 3.16, drf-spectacular, psycopg 3, PostgreSQL 18, Redis 7 (fakeredis in tests), PyJWT, cryptography, uuid6, pytest + pytest-django.
 
 **Spec:** `docs/HLD.md` and `docs/LLD.md`. **The LLD is the source of every signature, table, route, status code and serializer field.** A task names the LLD section it implements and does not repeat it.
@@ -20,7 +22,7 @@
 - Models use the `CommonX` / `X` / `XLog` triad with `AddCommonField` and `CustomUpdateManager.set_logModel("app.XLog", "app.X")` (LLD §3.5). Repositories follow LLD §2.4 (add = `save(force_insert=True)`; save = load, apply, `save(update_fields=…)`) and §2.5 (savepoint around constraint writes).
 - `domain/` imports no Django. Cross-app imports go only through `<app>.public`. Services log ids only; PII and card fields are `field(repr=False)`.
 - Routes have no trailing slash and live under `/hotel/v1/` (LLD §10.1). Status codes are `21MMEEE` with `http_status` on the `StatusCode` (LLD §3.2).
-- **Trimmed scope** (approved). `ApiEncryptionMiddleware` / `api_crypto` and `DynamicPricing` are design-only: do not build them. `DYNAMIC` is registered as an alias of `WEEKEND`. The README lists both under "Designed, not built".
+- **Full scope** (deadline moved to 01:00): API payload encryption (LLD §3.7 api_crypto, §3.8 row 4) is Task 1c, and `DynamicPricing` with its occupancy adapter is part of Task 5. Nothing is pushed to GitHub; the repository stays local.
 - Tests use `REDIS_URL=fakeredis://`. Pure unit tests need no database. DB tests are marked `@pytest.mark.django_db` and run against Postgres from docker compose.
 
 ## Review Focus
@@ -97,7 +99,7 @@
 - Produces:
   - `JwtTokenService`, `get_token_service`, `IdorRule`, `IdorGuard`, `Ownership`, `OwnershipResolver`, `ownership_registry`, `require_roles`, `IsAuthenticatedPrincipal`, `client_ip`.
   - `BaseViewSet` (with `permission_classes_by_action`, `throttle_scope_by_action`, `idor_rules`), `PrincipalAuthentication`, `RedisRateLimitThrottle`, `idempotent(scope, *, required=True, ...)`.
-  - `HealthView`, `DevTokenView`, `not_found`, `server_error`, and `hotel_commons.api.urls` (health, dev/tokens when local, schema, docs). No `PublicKeyView` (payload encryption is design-only).
+  - `HealthView`, `DevTokenView`, `not_found`, `server_error`, and `hotel_commons.api.urls` (health, dev/tokens when local, schema, docs). The `security/public-key` route points at `hotel_commons.api.encryption_views.PublicKeyView` (Task 1c).
 
 - [ ] **Step 1: Write failing tests.**
   - `test_jwt_valid_expired_wrong_key_alg_none_oversized_sub`
@@ -111,6 +113,27 @@
 - [ ] **Step 3:** Implement per LLD. Run the Lua script with Redis `TIME`; if fakeredis can't, use the `ARGV[4]` fallback from LLD §3.10.
 - [ ] **Step 4:** Run the same command → PASS.
 - [ ] **Step 5:** Commit `feat(commons): JWT, IDOR, rate limiter, idempotency, middlewares`.
+
+### Task 1c: API payload encryption (LLD §3.7 api_crypto, §3.8 row 4)
+
+**Files:**
+- Create: `libs/hotel-commons/hotel_commons/security/api_crypto.py`, `libs/hotel-commons/hotel_commons/middlewares/api_encryption.py`, `libs/hotel-commons/hotel_commons/api/encryption_views.py` (`PublicKeyView`), `scripts/encrypted_request.py`
+- Tests: `libs/hotel-commons/tests/test_api_encryption.py`
+
+**Interfaces:**
+- Produces `HybridPayloadCipher`, `HybridPayloadClient`, `EncryptedRequest`, `get_payload_cipher`, `ApiEncryptionMiddleware` and `PublicKeyView`, wire format per LLD §3.7.
+
+- [ ] **Step 1: Write failing tests:**
+  - `test_round_trip_request_and_response`
+  - `test_tampered_payload_rejected`
+  - `test_aad_binds_method_and_path`
+  - `test_replayed_wrapped_key_rejected` (fakeredis)
+  - `test_stale_timestamp_rejected`
+  - `test_enforced_mode_rejects_plaintext`
+  - `test_fresh_nonce_per_encryption`
+- [ ] **Step 2:** Run `.venv/bin/pytest libs/hotel-commons/tests/test_api_encryption.py -q` → FAIL.
+- [ ] **Step 3:** Implement with `cryptography` (RSA-3072 OAEP-SHA256, AESGCM).
+- [ ] **Step 4:** Same command → PASS.
 
 ### Task 2: `inventory` app (LLD §5)
 
@@ -208,7 +231,7 @@
 - [ ] **Step 4:** Run `.venv/bin/pytest catalog -q` → PASS.
 - [ ] **Step 5:** Commit `feat(catalog): owners, properties, room types, onboarding`.
 
-### Task 5: `pricing` app (LLD §6, trimmed)
+### Task 5: `pricing` app (LLD §6)
 
 **Files:**
 - Create: `pricing/domain/{quote,strategies,registry}.py`, `pricing/interfaces/ports.py`, `pricing/adapters/inventory_occupancy.py`
@@ -223,7 +246,8 @@
   - `test_standard_every_night_base`
   - `test_weekend_friday_saturday_times_1_20`, e.g. base ₹4,000 Fri night = 480000 paisa
   - `test_total_is_per_room_total_times_rooms`
-  - `test_every_strategy_code_registered` (DYNAMIC → WEEKEND alias)
+  - `test_every_strategy_code_registered`
+  - `test_dynamic_surge_tiers` (occupancy 0.70 → ×1.10, 0.90 → ×1.25, combined with weekend)
 - [ ] **Step 2:** Run `.venv/bin/pytest pricing -q` → FAIL.
 - [ ] **Step 3:** Implement. Rounding per night is `ROUND_HALF_UP` to whole paisa.
 - [ ] **Step 4:** Run `.venv/bin/pytest pricing -q` → PASS.
