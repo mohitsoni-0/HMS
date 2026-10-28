@@ -396,7 +396,7 @@ Any route that touches the database can also answer 409 `2100019` (busy) or 503 
 The tests run on the host and use a local virtualenv. The container image is Python 3.13. The host venv also works on 3.12.
 
 ```sh
-python3.13 -m venv .venv
+python3.12 -m venv .venv       # or python3.13; other versions are untested
 .venv/bin/pip install -r requirements-dev.txt
 ```
 
@@ -409,7 +409,7 @@ python3.13 -m venv .venv
 | Contract: the OpenAPI document validates with no warnings, and real responses match it (`tests/contract/`) | Postgres from docker compose | `./run-tests.sh tests/contract` |
 | Integration: end-to-end flows, the brief's edge cases over HTTP, concurrency races (`-m integration`) | Postgres from docker compose | `./run-tests.sh -m integration` |
 
-`./run-tests.sh` runs `docker compose up -d --wait postgres redis` and then `.venv/bin/pytest -q`, passing along any extra arguments:
+`./run-tests.sh` runs `docker compose up -d --wait postgres redis` and then `.venv/bin/pytest`, passing along any extra arguments:
 
 ```sh
 ./run-tests.sh                        # the whole suite

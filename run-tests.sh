@@ -6,4 +6,4 @@ cd "$(dirname "$0")"
 
 docker compose up -d --wait postgres redis
 
-exec .venv/bin/pytest -q "$@"
+exec .venv/bin/pytest "$@"  # pytest.ini already passes -q; a second one would hide the summary line
