@@ -51,6 +51,9 @@ class OwnershipRegistry:
             raise ValueError(f"Resource {resource!r} already has a {type(current).__name__} resolver")
         self._resolvers[resource] = resolver
 
+    def __contains__(self, resource: str) -> bool:
+        return resource in self._resolvers
+
     def resolve(self, resource: str, resource_id: UUID) -> Ownership | None:
         """The ownership of ``resource_id``; LookupError for an unregistered resource (a wiring bug, so a 500)."""
         resolver = self._resolvers.get(resource)

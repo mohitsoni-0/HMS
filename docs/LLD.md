@@ -21,6 +21,7 @@ hotel-booking-service/
 │   └── tests/
 ├── tests/                            # cross-app tests (§14)
 │   ├── architecture/test_module_boundaries.py      # AST walk: public-only cross-app imports, acyclic graph
+│   ├── architecture/test_idor_coverage.py          # URLconf walk: every id in a path has an IDOR rule
 │   ├── contract/test_openapi_schema.py             # schema validates, no warnings; responses match it
 │   ├── infra/                                      # entrypoint, compose ports, bootstrap_env.py, card fixtures
 │   ├── integration/conftest.py                     # truncate_context_tables for transaction=True tests
@@ -540,6 +541,7 @@ class OwnershipResolver(ABC):
 class OwnershipRegistry:
     def register(self, resource: str, resolver: OwnershipResolver) -> None: ...
     def resolve(self, resource: str, resource_id: UUID) -> Ownership | None: ...   # no cache (straight from Postgres)
+    def __contains__(self, resource: str) -> bool: ...                               # used by the IDOR coverage test
 
 ownership_registry = OwnershipRegistry()
 
@@ -563,6 +565,9 @@ class IdorGuard:
     def can_access(principal: Principal, ownership: Ownership, relations: frozenset[Relation]) -> bool: ...
     # (GUEST in roles and "guest" in relations and uid in guest_user_ids) or
     # (OWNER in roles and "owner" in relations and uid in owner_user_ids)
+# Coverage (tests/architecture/test_idor_coverage.py): every `*_id` path kwarg of a routed BaseViewSet action
+# has a path IdorRule on that key, unless the action is in PUBLIC_ACTIONS with a reason (today only
+# PropertyViewSet.retrieve, public catalog data) and is still AllowAny; every rule's resource has a resolver.
 ```
 
 ```python
@@ -2208,6 +2213,7 @@ Unit tests run without a database, using in-memory repositories and fakes. DB an
 | Payment | `payment/tests/test_payment_methods.py`, `test_charge_service.py` | Luhn, brands, VPA, wallet; duplicate key → same payment; refund limits; repr has no card data |
 | API end-to-end (db) | `tests/integration/test_booking_flow_api.py` | onboard → search → book → pay → cancel → search shows the room again; book → expire job → room bookable again |
 | Architecture | `tests/architecture/test_module_boundaries.py` | AST walk over every import (function-level and `TYPE_CHECKING` included, `tests/` excluded): cross-app imports only via `<app>.public` (migrations too); `hotel_commons` imports no app; no Django/DRF/drf-spectacular in any `domain/` or `interfaces/`; `services/` import no other app; app graph acyclic and equal to the HLD §3.4 map; negative controls on synthetic sources |
+| IDOR coverage | `tests/architecture/test_idor_coverage.py` | walk of the live URLconf: every `*_id` path kwarg of a `BaseViewSet` action has a path `IdorRule` on that key or a reasoned `PUBLIC_ACTIONS` entry that is still `AllowAny`; every rule's resource has a resolver; negative controls on synthetic viewsets |
 | Container config | `tests/infra/` | gunicorn access-log format renders no query string or Referer (rendered through gunicorn's own logger); `migrate` alone runs with `DB_*_TIMEOUT_MS=0`, and settings drop the timeouts only then; every compose port bound to `127.0.0.1`; `bootstrap_env.py` keys pass `validate_security_settings` as production, differ per run, RSA-3072, refuses to overwrite without `--force`; no literal card expiry year in root tests or the README |
 
 ## 15. Build order and file ownership

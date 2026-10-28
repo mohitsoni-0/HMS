@@ -403,7 +403,7 @@ python3.13 -m venv .venv
 | Kind | Needs | Examples |
 |---|---|---|
 | Unit: domain, services against in-memory repositories and fakes, the shared library | nothing (Redis is always `fakeredis`) | `.venv/bin/pytest libs/hotel-commons/tests pricing booking/tests/test_state_machine.py booking/tests/test_booking_services.py` |
-| Architecture: module boundaries from the source's AST (`tests/architecture/`) | nothing | `.venv/bin/pytest -p no:django tests/architecture` |
+| Architecture: module boundaries from the source's AST, and IDOR coverage of every routed id from the URLconf (`tests/architecture/`) | nothing | `.venv/bin/pytest tests/architecture` |
 | Container config: entrypoint, compose ports, `scripts/bootstrap_env.py` (`tests/infra/`) | nothing | `.venv/bin/pytest tests/infra` |
 | DB: API and repository tests (`@pytest.mark.django_db`) | Postgres from docker compose | `./run-tests.sh catalog` |
 | Contract: the OpenAPI document validates with no warnings, and real responses match it (`tests/contract/`) | Postgres from docker compose | `./run-tests.sh tests/contract` |
